@@ -1,0 +1,103 @@
+# Single-environment values (this is the only env — there is no dev/prod split).
+# Argo CD on the target cluster renders the chart with this file
+# (see ../../argo/application.yaml). EDIT the placeholders below per project.
+
+namespace: app
+
+image:
+  # Harbor over the tailnet (host tailscaled + MagicDNS → pods resolve *.ts.net
+  # via the coredns-custom forward). Same build server + Harbor as your other
+  # projects; only the project path differs.
+  registry: harbor.tail41bc66.ts.net
+  pullPolicy: Always
+  pullSecret: regcred                 # docker-registry Secret with Harbor creds
+  backend:
+    repo: your-project/backend        # CHANGE ME (Harbor project path)
+    tag: latest                       # CI pushes :latest + :<sha>; updater watches :latest digest
+    image: ""                         # full ref — Argo Image Updater writes here (digest-safe)
+  frontend:
+    repo: your-project/frontend       # CHANGE ME
+    tag: latest
+    image: ""                         # full ref — Argo Image Updater writes here
+  postgres:
+    repo: your-project/postgres       # CHANGE ME — custom postgres+WAL-G image
+    tag: latest                       # rebuilt by CI; not auto-updated by Image Updater
+
+# Public host. Single host, path routing: /api → backend, / → frontend.
+domain: app.example.com               # CHANGE ME
+
+ingress:
+  enabled: true
+  className: traefik                  # k3s default ingress controller
+  entrypoint: websecure
+  certResolver: le                   # Traefik ACME resolver; or use cert-manager below
+  certManagerIssuer: ""              # if set, uses cert-manager instead of Traefik certResolver
+  tlsSecretName: app-tls
+
+# Argo Rollouts strategy knobs.
+rollouts:
+  blueGreen:
+    scaleDownDelaySeconds: 30         # how long the old ReplicaSet lingers after promotion
+    autoPromotionEnabled: true        # auto-promote once preview is healthy (Image-Updater-driven)
+  canary:
+    maxSurge: 1
+    maxUnavailable: 0
+
+backend:
+  replicas: 2
+
+frontend:
+  replicas: 2
+
+# MAX warm-shutdown drain window (sec) before SIGKILL, applied to every worker.
+# CEILING, not a fixed wait: Celery exits the moment in-flight tasks finish
+# (idle worker exits in ~1s on deploy). Must exceed your longest task so a
+# deploy never SIGKILLs a task mid-run. Per-worker override via
+# workers.<queue>.gracePeriod.
+workersGracePeriod: 600
+
+# One Rollout per queue. Names MUST match the queues in app/celery_app.py
+# task_routes. concurrency = worker processes per pod.
+workers:
+  default: { concurrency: 4, replicas: 1 }
+  emails:  { concurrency: 2, replicas: 1 }
+
+beat:
+  enabled: true
+
+storage:
+  dbSize: 20Gi
+  redisSize: 5Gi
+  storageClass: ""                    # "" = cluster default (k3s local-path)
+
+# WAL-G continuous archiving + scheduled base backups to an EXTERNAL S3 bucket.
+# Set the bucket/endpoint here; credentials come from the app-dotenv Secret
+# (S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY).
+walg:
+  s3Prefix: s3://your-bucket/walg     # CHANGE ME
+  endpoint: ""                        # empty = real AWS S3; set for B2/MinIO/etc.
+  forcePathStyle: "true"              # "true" for MinIO/B2, "false" for AWS S3
+  retainFull: "7"
+  uploadConcurrency: "2"
+  compression: lz4
+  backupSchedule: "86400"             # seconds between base backups (86400 = daily)
+
+# Non-secret topology env (ConfigMap, LAST in envFrom → overrides the .env
+# Secret). Only put here: (1) topology the chart must force (service
+# hostnames/ports), (2) keys other templates read via configMapKeyRef
+# (POSTGRES_USER/DB) or render directly (S3 region/bucket in WAL-G env).
+# User prefs (PROJECT_NAME, SMTP_*, API keys) stay OUT — they come from the Secret.
+env:
+  ENVIRONMENT: production
+  POSTGRES_SERVER: pgbouncer          # app talks to the pooler, not Postgres directly
+  POSTGRES_PORT: "6432"
+  POSTGRES_DB: app
+  POSTGRES_USER: postgres
+  REDIS_URL: redis://redis:6379/0
+  CELERY_BROKER_URL: redis://redis:6379/0
+  CELERY_RESULT_BACKEND: redis://redis:6379/1
+  S3_ENDPOINT_URL: ""                 # empty = real AWS S3; set for B2/MinIO/etc.
+  S3_BUCKET_NAME: app
+  S3_REGION: us-east-1
+  FRONTEND_HOST: https://app.example.com          # CHANGE ME (matches domain)
+  BACKEND_CORS_ORIGINS: https://app.example.com   # CHANGE ME

@@ -1,0 +1,74 @@
+# Rootless BuildKit daemon — persistent, shared by all CI builds.
+# One beefy daemon on the 48-core build server: true DAG parallelism,
+# multi-core compression, and a PVC-backed cache (layers + RUN --mount caches:
+# uv wheels, apt lists) that survives across builds → second builds in seconds.
+#
+# No privileged. Rootless needs only: seccomp Unconfined + AppArmor unconfined
+# + kernel unprivileged user namespaces. Ubuntu 24.04+ host prerequisite:
+#   echo kernel.apparmor_restrict_unprivileged_userns=0 | sudo tee /etc/sysctl.d/60-buildkit.conf
+#   sudo sysctl --system
+#
+# No mTLS — ClusterIP only, single-node trusted cluster.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: buildkit-cache
+  namespace: argo
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: buildkitd
+  namespace: argo
+spec:
+  selector:
+    app.kubernetes.io/name: buildkitd
+  ports:
+    - { name: buildkit, port: 1234, targetPort: 1234 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: buildkitd
+  namespace: argo
+spec:
+  replicas: 1
+  strategy: { type: Recreate }   # single RWO cache volume
+  selector:
+    matchLabels: { app.kubernetes.io/name: buildkitd }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: buildkitd }
+    spec:
+      securityContext:
+        fsGroup: 1000            # PVC writable by the rootless user
+      containers:
+        - name: buildkitd
+          image: moby/buildkit:v0.23.2-rootless
+          args:
+            - --addr
+            - tcp://0.0.0.0:1234
+            - --oci-worker-no-process-sandbox
+          ports:
+            - containerPort: 1234
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            seccompProfile: { type: Unconfined }
+            appArmorProfile: { type: Unconfined }
+          readinessProbe:
+            tcpSocket: { port: 1234 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: cache
+              mountPath: /home/user/.local/share/buildkit
+      volumes:
+        - name: cache
+          persistentVolumeClaim:
+            claimName: buildkit-cache

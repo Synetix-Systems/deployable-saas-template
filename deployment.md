@@ -1,344 +1,194 @@
-# FastAPI Project - Deployment
+# Deployment
 
-You can deploy the project using Docker Compose to a remote server.
+This project deploys to **k3s** via the Helm chart in [`charts/app`](charts/app),
+delivered by **Argo CD** with a GitOps pipeline. There is **one environment**
+(production). Docker Compose is for [local development](development.md) only —
+it is never used to deploy.
 
-This project expects you to have a Traefik proxy handling communication to the outside world and HTTPS certificates.
+## Topology
 
-You can use CI/CD (continuous integration and continuous deployment) systems to deploy automatically, there are already configurations to do it with GitHub Actions.
+Two machines on a Tailscale tailnet:
 
-But you have to configure a couple things first. 🤓
+| Machine | Cluster context | Runs |
+|---|---|---|
+| **App server** | `app` | k3s + Traefik, Argo CD + Image Updater + Argo Rollouts, the app + infra (Postgres/Redis/pgbouncer), **Harbor registry** |
+| **Build server** | `build` | k3s, Argo Workflows + Events, buildkitd (may be powered off when idle) |
 
-## Preparation
-
-* Have a remote server ready and available.
-* Configure the DNS records of your domain to point to the IP of the server you just created.
-* Configure a wildcard subdomain for your domain, so that you can have multiple subdomains for different services, e.g. `*.fastapi-project.example.com`. This will be useful for accessing different components, like `dashboard.fastapi-project.example.com`, `api.fastapi-project.example.com`, `traefik.fastapi-project.example.com`, `adminer.fastapi-project.example.com`, etc. And also for `staging`, like `dashboard.staging.fastapi-project.example.com`, `adminer.staging.fastapi-project.example.com`, etc.
-* Install and configure [Docker](https://docs.docker.com/engine/install/) on the remote server (Docker Engine, not Docker Desktop).
-
-## Public Traefik
-
-We need a Traefik proxy to handle incoming connections and HTTPS certificates.
-
-You need to do these next steps only once.
-
-### Traefik Docker Compose
-
-* Create a remote directory to store your Traefik Docker Compose file:
-
-```bash
-mkdir -p /root/code/traefik-public/
+```
+GitHub push (master) ──webhook──▶ BUILD SERVER
+                       Argo Events EventSource → Sensor → Argo Workflows
+                          BuildKit build → push :latest + :<sha>
+                                     │ over the tailnet
+                          Harbor  harbor.tail41bc66.ts.net/your-project/*
+                                     │
+                               APP SERVER
+                       Argo CD + Image Updater (polls :latest digest)
+                                     │
+                       Argo Rollouts: blue-green (backend/frontend),
+                                      canary (workers/beat)
 ```
 
-Copy the Traefik Docker Compose file to your server. You could do it by running the command `rsync` in your local terminal:
+- **Config comes from GitHub** — Argo CD watches `charts/app` on `master`.
+- **Images come from Harbor** over the tailnet.
+- The app server runs its own Postgres/Redis — one database, one environment.
+
+## Helm chart (`charts/app/`)
+
+`values.yaml` holds everything (single env — no per-env overlay). Workloads are
+**Argo Rollouts**, not Deployments:
+
+| Workload | Strategy | Notes |
+|---|---|---|
+| backend, frontend | blueGreen (active + `-preview` Services) | Ingress targets the active Service |
+| worker-{default,emails} | canary, maxSurge 1 / maxUnavailable 0 | Celery warm shutdown finishes in-flight tasks (grace `workersGracePeriod`, 600s) |
+| beat | canary, maxSurge 0 / maxUnavailable 1 | singleton scheduler — never two beats |
+| db (StatefulSet) | — | postgres + **pgbackup sidecar** (WAL-G) in one pod (`2/2`), shared PGDATA volume |
+| redis, pgbouncer | plain Deployments | pinned images, no auto-update |
+
+Argo CD **sync waves**: infra (0) → `prestart` Job (1, Sync hook, re-created
+every sync — runs alembic migrations + seeds the superuser) → app Rollouts (2).
+
+## Prerequisites (one-time, per cluster)
+
+Install on the **app** cluster:
+
+- k3s (ships Traefik + `local-path` storage).
+- [Argo CD](https://argo-cd.readthedocs.io/), [Argo Rollouts](https://argo-rollouts.readthedocs.io/) CRDs + controller, [Argo Image Updater](https://argocd-image-updater.readthedocs.io/) (v1.x, CR-driven).
+- `kubectl apply -f argo/coredns-custom.yaml` then `kubectl -n kube-system rollout restart deploy/coredns` (lets pods resolve `*.ts.net` Harbor).
+
+Install on the **build** cluster:
+
+- Argo Workflows + Argo Events.
+- `kubectl apply -f argo/workflows/buildkitd.yaml` (rootless BuildKit — see the file header for the host sysctl prereq).
+- `kubectl apply -f argo/events/` (EventBus, EventSource, NodePort, Sensor), then expose the webhook (e.g. `tailscale funnel --bg http://localhost:30120`) and point your GitHub repo webhook (push events, JSON) at it.
+
+## Secrets
+
+Create these out-of-band (never committed):
+
+| Secret | Namespace(s) | Cluster | Contents |
+|---|---|---|---|
+| `app-dotenv` | `app` | app | full app env, from your `.env` |
+| `regcred` | `app`, `argocd` | app | Harbor docker-registry creds (image pull + Image Updater) |
+| `regcred` | `argo` | build | same — BuildKit push |
+| `github-creds` | `argo` | build | `username` + `token` (PAT, repo read) for cloning the private repo |
+| repo credential | `argocd` | app | Argo CD repo access (label `argocd.argoproj.io/secret-type: repository`) |
+
+`app-dotenv` is the **default home for all secret env** — `SECRET_KEY`,
+`POSTGRES_PASSWORD`, `FIRST_SUPERUSER*`, `PROJECT_NAME` (required by pydantic —
+no default!), SMTP, `S3_ACCESS_KEY_ID`/`S3_SECRET_ACCESS_KEY`, etc. Create it
+from an env file:
 
 ```bash
-rsync -a compose.traefik.yml root@your-server.example.com:/root/code/traefik-public/
+kubectl --context app -n app create secret generic app-dotenv \
+  --from-env-file=/path/to/prod.env
 ```
 
-### Traefik Public Network
-
-This Traefik will expect a Docker "public network" named `traefik-public` to communicate with your stack(s).
-
-This way, there will be a single public Traefik proxy that handles the communication (HTTP and HTTPS) with the outside world, and then behind that, you could have one or more stacks with different domains, even if they are on the same single server.
-
-To create a Docker "public network" named `traefik-public` run the following command in your remote server:
+Harbor pull secret (quote the robot name — `$` expands otherwise):
 
 ```bash
-docker network create traefik-public
+kubectl --context app -n app create secret docker-registry regcred \
+  --docker-server=harbor.tail41bc66.ts.net \
+  --docker-username='robot$your-project+ci' --docker-password='<token>'
+# repeat in the argocd namespace (Image Updater) and on the build cluster's argo ns
 ```
 
-### Traefik Environment Variables
+## Environment variable rules (READ BEFORE ADDING ENV)
 
-The Traefik Docker Compose file expects some environment variables to be set in your terminal before starting it. You can do it by running the following commands in your remote server.
+Pods load env via `envFrom`: **Secret `app-dotenv` first, ConfigMap `app-env`
+second → the ConfigMap wins on conflicts.**
 
-* Create the username for HTTP Basic Auth, e.g.:
+- **Secret (`app-dotenv`)** = default home for everything (see above).
+- **ConfigMap (chart `env:` block in `values.yaml`)** = ONLY:
+  1. topology the chart must force (`POSTGRES_SERVER=pgbouncer`, `REDIS_URL`,
+     `S3_ENDPOINT_URL`, domain/CORS) — your local `.env` may say `localhost`,
+     the cluster value must win;
+  2. keys other templates read (`POSTGRES_USER`/`POSTGRES_DB`, `S3_REGION`).
+
+  Putting a user preference here silently overrides the Secret. Keep prefs out.
+- Secret changes do NOT restart pods. After editing: re-sync the app (re-runs
+  prestart) and delete pods that need the new env.
+
+## What to change for your project
+
+Search the placeholders and replace:
+
+- `charts/app/values.yaml` — `domain`, `image.*.repo` (Harbor project path), `walg.s3Prefix`, `S3_*`, `FRONTEND_HOST`, `BACKEND_CORS_ORIGINS`.
+- `argo/application.yaml` + `argo/00-appproject.yaml` — `repoURL`/`sourceRepos`, the Harbor `your-project` path in the image-list.
+- `argo/workflows/ci-workflowtemplate.yaml` + `argo/events/sensor.yaml` — `repo` and the `your-project/*` image paths.
+
+The registry host `harbor.tail41bc66.ts.net` is shared across projects — only
+the project path differs.
+
+## Deploy
+
+Once bootstrapped, deploying is just:
 
 ```bash
-export USERNAME=admin
+git push origin master
 ```
 
-* Create an environment variable with the password for HTTP Basic Auth, e.g.:
+Build (~1–2 min warm) → Image Updater (≤2 min digest poll) → blue-green roll.
+Nothing manual.
+
+### Watch a rollout
 
 ```bash
-export PASSWORD=changethis
+kubectl --context app -n argocd get applications
+kubectl --context app -n app get rollouts,pods
+kubectl --context build -n argo get wf            # builds
 ```
 
-* Use openssl to generate the "hashed" version of the password for HTTP Basic Auth and store it in an environment variable:
+### Force a sync / re-run migrations (prestart)
 
 ```bash
-export HASHED_PASSWORD=$(openssl passwd -apr1 $PASSWORD)
+kubectl --context app -n argocd patch application app \
+  --type merge -p '{"operation":{"sync":{}}}'
 ```
 
-To verify that the hashed password is correct, you can print it:
+Hooks use `BeforeHookCreation` — prestart is deleted + re-created each sync.
+
+### Rollback
+
+Every build also pushes an immutable `:<sha>` tag. Retag a previous SHA over
+the rolling tag and Image Updater rolls back on the digest change:
 
 ```bash
-echo $HASHED_PASSWORD
+crane copy harbor.tail41bc66.ts.net/your-project/backend:<old-sha> \
+           harbor.tail41bc66.ts.net/your-project/backend:latest
 ```
 
-* Create an environment variable with the domain name for your server, e.g.:
+(Or `git revert` + normal pipeline.)
+
+## Manual install (no Argo CD)
+
+The chart is plain Helm — you can install it directly for a one-off cluster.
+The `prestart` Sync hook runs as an ordinary Job:
 
 ```bash
-export DOMAIN=fastapi-project.example.com
+kubectl create namespace app
+kubectl -n app create secret generic app-dotenv --from-env-file=prod.env
+kubectl -n app create secret docker-registry regcred --docker-server=... ...
+helm upgrade --install app ./charts/app -n app
 ```
 
-* Create an environment variable with the email for Let's Encrypt, e.g.:
+Requires the Argo Rollouts CRDs + controller in the cluster (the Rollout
+resources need the controller to progress).
 
-```bash
-export EMAIL=admin@example.com
-```
+## Database migrations under blue-green
 
-**Note**: you need to set a different email, an email `@example.com` won't work.
+Migrations run in the prestart Job **before** the green pods take traffic —
+while the **blue pods still serve** the previous code. Any column/table the
+blue code still uses must survive the migration, or blue pods 500 mid-rollout.
 
-### Start the Traefik Docker Compose
-
-Go to the directory where you copied the Traefik Docker Compose file in your remote server:
-
-```bash
-cd /root/code/traefik-public/
-```
-
-Now with the environment variables set and the `compose.traefik.yml` in place, you can start the Traefik Docker Compose running the following command:
-
-```bash
-docker compose -f compose.traefik.yml up -d
-```
-
-## Deploy the FastAPI Project
-
-Now that you have Traefik in place you can deploy your FastAPI project with Docker Compose.
-
-**Note**: You might want to jump ahead to the section about Continuous Deployment with GitHub Actions.
-
-## Copy the Code
-
-```bash
-rsync -av --filter=":- .gitignore" ./ root@your-server.example.com:/root/code/app/
-```
-
-Note: `--filter=":- .gitignore"` tells `rsync` to use the same rules as git, ignore files ignored by git, like the Python virtual environment.
-
-## Environment Variables
-
-You need to set some environment variables first.
-
-### Generate secret keys
-
-Some environment variables in the `.env` file have a default value of `changethis`.
-
-You have to change them with a secret key, to generate secret keys you can run the following command:
-
-```bash
-python -c "import secrets; print(secrets.token_urlsafe(32))"
-```
-
-Copy the content and use that as password / secret key. And run that again to generate another secure key.
-
-### Required Environment Variables
-
-Set the `ENVIRONMENT`, by default `local` (for development), but when deploying to a server you would put something like `staging` or `production`:
-
-```bash
-export ENVIRONMENT=production
-```
-
-Set the `DOMAIN`, by default `localhost` (for development), but when deploying you would use your own domain, for example:
-
-```bash
-export DOMAIN=fastapi-project.example.com
-```
-
-Set the `POSTGRES_PASSWORD` to something different than `changethis`:
-
-```bash
-export POSTGRES_PASSWORD="changethis"
-```
-
-Set the `SECRET_KEY`, used to sign tokens:
-
-```bash
-export SECRET_KEY="changethis"
-```
-
-Note: you can use the Python command above to generate a secure secret key.
-
-Set the `FIRST_SUPER_USER_PASSWORD` to something different than `changethis`:
-
-```bash
-export FIRST_SUPERUSER_PASSWORD="changethis"
-```
-
-Set the `BACKEND_CORS_ORIGINS` to include your domain:
-
-```bash
-export BACKEND_CORS_ORIGINS="https://dashboard.${DOMAIN?Variable not set},https://api.${DOMAIN?Variable not set}"
-```
-
-You can set several other environment variables:
-
-* `PROJECT_NAME`: The name of the project, used in the API for the docs and emails.
-* `STACK_NAME`: The name of the stack used for Docker Compose labels and project name, this should be different for `staging`, `production`, etc. You could use the same domain replacing dots with dashes, e.g. `fastapi-project-example-com` and `staging-fastapi-project-example-com`.
-* `BACKEND_CORS_ORIGINS`: A list of allowed CORS origins separated by commas.
-* `FIRST_SUPERUSER`: The email of the first superuser, this superuser will be the one that can create new users.
-* `SMTP_HOST`: The SMTP server host to send emails, this would come from your email provider (E.g. Mailgun, Sparkpost, Sendgrid, etc).
-* `SMTP_USER`: The SMTP server user to send emails.
-* `SMTP_PASSWORD`: The SMTP server password to send emails.
-* `EMAILS_FROM_EMAIL`: The email account to send emails from.
-* `POSTGRES_SERVER`: The hostname of the PostgreSQL server. You can leave the default of `db`, provided by the same Docker Compose. You normally wouldn't need to change this unless you are using a third-party provider.
-* `POSTGRES_PORT`: The port of the PostgreSQL server. You can leave the default. You normally wouldn't need to change this unless you are using a third-party provider.
-* `POSTGRES_USER`: The Postgres user, you can leave the default.
-* `POSTGRES_DB`: The database name to use for this application. You can leave the default of `app`.
-* `SENTRY_DSN`: The DSN for Sentry, if you are using it.
-
-## GitHub Actions Environment Variables
-
-There are some environment variables only used by GitHub Actions that you can configure:
-
-* `LATEST_CHANGES`: Used by the GitHub Action [latest-changes](https://github.com/tiangolo/latest-changes) to automatically add release notes based on the PRs merged. It's a personal access token, read the docs for details.
-* `SMOKESHOW_AUTH_KEY`: Used to handle and publish the code coverage using [Smokeshow](https://github.com/samuelcolvin/smokeshow), follow their instructions to create a (free) Smokeshow key.
-
-### Deploy with Docker Compose
-
-With the environment variables in place, you can deploy with Docker Compose:
-
-```bash
-cd /root/code/app/
-docker compose -f compose.yml build
-docker compose -f compose.yml up -d
-```
-
-For production you wouldn't want to have the overrides in `compose.override.yml`, that's why we explicitly specify `compose.yml` as the file to use.
-
-## Continuous Deployment (CD)
-
-You can use GitHub Actions to deploy your project automatically. 😎
-
-You can have multiple environment deployments.
-
-There are already two environments configured, `staging` and `production`. 🚀
-
-### Install GitHub Actions Runner
-
-* On your remote server, create a user for your GitHub Actions:
-
-```bash
-sudo adduser github
-```
-
-* Add Docker permissions to the `github` user:
-
-```bash
-sudo usermod -aG docker github
-```
-
-* Temporarily switch to the `github` user:
-
-```bash
-sudo su - github
-```
-
-* Go to the `github` user's home directory:
-
-```bash
-cd
-```
-
-* [Install a GitHub Action self-hosted runner following the official guide](https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/adding-self-hosted-runners#adding-a-self-hosted-runner-to-a-repository).
-
-* When asked about labels, add a label for the environment, e.g. `production`. You can also add labels later.
-
-After installing, the guide would tell you to run a command to start the runner. Nevertheless, it would stop once you terminate that process or if your local connection to your server is lost.
-
-To make sure it runs on startup and continues running, you can install it as a service. To do that, exit the `github` user and go back to the `root` user:
-
-```bash
-exit
-```
-
-After you do it, you will be on the previous user again. And you will be on the previous directory, belonging to that user.
-
-Before being able to go the `github` user directory, you need to become the `root` user (you might already be):
-
-```bash
-sudo su
-```
-
-* As the `root` user, go to the `actions-runner` directory inside of the `github` user's home directory:
-
-```bash
-cd /home/github/actions-runner
-```
-
-* Install the self-hosted runner as a service with the user `github`:
-
-```bash
-./svc.sh install github
-```
-
-* Start the service:
-
-```bash
-./svc.sh start
-```
-
-* Check the status of the service:
-
-```bash
-./svc.sh status
-```
-
-You can read more about it in the official guide: [Configuring the self-hosted runner application as a service](https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/configuring-the-self-hosted-runner-application-as-a-service).
-
-### Set Secrets
-
-On your repository, configure secrets for the environment variables you need, the same ones described above, including `SECRET_KEY`, etc. Follow the [official GitHub guide for setting repository secrets](https://docs.github.com/en/actions/security-guides/using-secrets-in-github-actions#creating-secrets-for-a-repository).
-
-The current Github Actions workflows expect these secrets:
-
-* `DOMAIN_PRODUCTION`
-* `DOMAIN_STAGING`
-* `STACK_NAME_PRODUCTION`
-* `STACK_NAME_STAGING`
-* `EMAILS_FROM_EMAIL`
-* `FIRST_SUPERUSER`
-* `FIRST_SUPERUSER_PASSWORD`
-* `POSTGRES_PASSWORD`
-* `SECRET_KEY`
-* `LATEST_CHANGES`
-* `SMOKESHOW_AUTH_KEY`
-
-## GitHub Action Deployment Workflows
-
-There are GitHub Action workflows in the `.github/workflows` directory already configured for deploying to the environments (GitHub Actions runners with the labels):
-
-* `staging`: after pushing (or merging) to the branch `master`.
-* `production`: after publishing a release.
-
-If you need to add extra environments you could use those as a starting point.
+- Additive changes (new nullable columns, new tables, backfills) are always safe.
+- **Never drop a column/table in the same release that removes the code using
+  it.** Ship the `DROP` one release later, once no deployed code references it.
 
 ## URLs
 
-Replace `fastapi-project.example.com` with your domain.
+Replace `app.example.com` with your domain.
 
-### Main Traefik Dashboard
-
-Traefik UI: `https://traefik.fastapi-project.example.com`
-
-### Production
-
-Frontend: `https://dashboard.fastapi-project.example.com`
-
-Backend API docs: `https://api.fastapi-project.example.com/docs`
-
-Backend API base URL: `https://api.fastapi-project.example.com`
-
-Adminer: `https://adminer.fastapi-project.example.com`
-
-### Staging
-
-Frontend: `https://dashboard.staging.fastapi-project.example.com`
-
-Backend API docs: `https://api.staging.fastapi-project.example.com/docs`
-
-Backend API base URL: `https://api.staging.fastapi-project.example.com`
-
-Adminer: `https://adminer.staging.fastapi-project.example.com`
+- Frontend: `https://app.example.com`
+- API docs: `https://app.example.com/docs`
+- API base: `https://app.example.com/api`

@@ -1,0 +1,20 @@
+# In-cluster DNS for the tailnet — forwards *.ts.net to Tailscale MagicDNS.
+# Without this, pods (Argo CD Image Updater!) cannot resolve
+# harbor.tail41bc66.ts.net and NOTHING auto-deploys, while node-level image
+# pulls still work (host resolver) — a confusing half-broken state.
+#
+# k3s's bundled CoreDNS imports this ConfigMap (coredns-custom, *.server keys)
+# automatically. Apply on EVERY cluster (app + build), then:
+#   kubectl -n kube-system rollout restart deploy/coredns
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns-custom
+  namespace: kube-system
+data:
+  ts-net.server: |
+    ts.net:53 {
+        errors
+        cache 30
+        forward . 100.100.100.100
+    }

@@ -1,0 +1,127 @@
+# Argo Workflows CI — BuildKit edition. RUNS ON THE BUILD SERVER's cluster.
+# On a master push it builds backend/frontend/postgres and pushes :latest +
+# :<sha> to Harbor. Argo Image Updater on the app cluster sees the new :latest
+# digest and rolls the Rollouts.
+#
+# Build mechanics:
+#   * initContainer clones the exact SHA into an emptyDir (alpine/git + PAT).
+#   * main container is a thin buildctl client against the persistent rootless
+#     buildkitd (tcp://buildkitd:1234) → DAG parallelism + PVC-backed cache
+#     (RUN --mount=type=cache survives across builds).
+#   * registry auth: regcred mounted, DOCKER_CONFIG → client forwards creds.
+#
+# Prereqs (namespace `argo`): buildkitd (buildkitd.yaml), SA argo-workflow,
+# Secret regcred (Harbor robot), Secret github-creds (username/token PAT).
+# CHANGE: the `repo` default and the `image` project paths (your-project/*).
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: app-ci
+  namespace: argo
+spec:
+  serviceAccountName: argo-workflow
+  entrypoint: main
+  arguments:
+    parameters:
+      - { name: repo, value: "github.com/your-org/your-repo" }   # ← CHANGE ME
+      - { name: ref, value: "refs/heads/master" }   # git ref, set by the Sensor
+      - { name: sha, value: "HEAD" }                # commit SHA, set by the Sensor
+  templates:
+    - name: main
+      inputs:
+        parameters: [{ name: repo }, { name: ref }, { name: sha }]
+      steps:
+        - - name: build
+            template: ci
+            when: "'{{inputs.parameters.ref}}' == 'refs/heads/master'"
+            arguments:
+              parameters:
+                - { name: repo, value: "{{inputs.parameters.repo}}" }
+                - { name: sha, value: "{{inputs.parameters.sha}}" }
+
+    - name: ci
+      inputs:
+        parameters: [{ name: repo }, { name: sha }]
+      steps:
+        - - name: build-backend
+            template: buildctl
+            arguments:
+              parameters:
+                - { name: repo, value: "{{inputs.parameters.repo}}" }
+                - { name: sha, value: "{{inputs.parameters.sha}}" }
+                - { name: dockerfile, value: backend/Dockerfile }
+                - { name: image, value: your-project/backend }   # ← CHANGE ME
+                - { name: tag, value: latest }
+                - { name: extra, value: "--progress=plain" }
+          - name: build-frontend
+            template: buildctl
+            arguments:
+              parameters:
+                - { name: repo, value: "{{inputs.parameters.repo}}" }
+                - { name: sha, value: "{{inputs.parameters.sha}}" }
+                - { name: dockerfile, value: frontend/Dockerfile }
+                - { name: image, value: your-project/frontend }  # ← CHANGE ME
+                - { name: tag, value: latest }
+                # SPA calls the API same-origin at /api → empty build arg.
+                - { name: extra, value: "--opt=build-arg:VITE_API_URL=" }
+          - name: build-postgres
+            template: buildctl
+            arguments:
+              parameters:
+                - { name: repo, value: "{{inputs.parameters.repo}}" }
+                - { name: sha, value: "{{inputs.parameters.sha}}" }
+                - { name: dockerfile, value: postgres/Dockerfile }
+                - { name: image, value: your-project/postgres }  # ← CHANGE ME
+                - { name: tag, value: latest }
+                - { name: extra, value: "--progress=plain" }
+
+    - name: buildctl
+      inputs:
+        parameters:
+          - { name: repo }
+          - { name: sha }
+          - { name: dockerfile }
+          - { name: image }
+          - { name: tag }
+          - { name: extra }      # one extra buildctl token (build-arg etc.)
+      volumes:
+        - { name: work, emptyDir: {} }
+        - name: regcred
+          secret:
+            secretName: regcred
+            items: [{ key: .dockerconfigjson, path: config.json }]
+      initContainers:
+        - name: clone
+          image: alpine/git:latest
+          command: [sh, -c]
+          args:
+            - |
+              set -e
+              git init -q /work && cd /work
+              git remote add origin "https://x-access-token:${GIT_TOKEN}@{{inputs.parameters.repo}}.git"
+              git fetch -q --depth 1 origin "{{inputs.parameters.sha}}"
+              git checkout -q FETCH_HEAD
+              echo "checked out $(git rev-parse HEAD)"
+          env:
+            - name: GIT_TOKEN
+              valueFrom: { secretKeyRef: { name: github-creds, key: token } }
+          mirrorVolumeMounts: true
+      container:
+        image: moby/buildkit:v0.23.2
+        command: [buildctl]
+        args:
+          - --addr
+          - tcp://buildkitd:1234
+          - build
+          - --frontend=dockerfile.v0
+          - --local=context=/work
+          - --local=dockerfile=/work
+          - "--opt=filename={{inputs.parameters.dockerfile}}"
+          - "{{inputs.parameters.extra}}"
+          - --output
+          - type=image,"name=harbor.tail41bc66.ts.net/{{inputs.parameters.image}}:{{inputs.parameters.tag}},harbor.tail41bc66.ts.net/{{inputs.parameters.image}}:{{inputs.parameters.sha}}",push=true
+        env:
+          - { name: DOCKER_CONFIG, value: /cfg }
+        volumeMounts:
+          - { name: work, mountPath: /work }
+          - { name: regcred, mountPath: /cfg }

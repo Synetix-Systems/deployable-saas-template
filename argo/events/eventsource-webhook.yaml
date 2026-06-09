@@ -1,0 +1,21 @@
+# Receives git push webhooks. Expose this Service via an Ingress/route your git
+# host (GitHub/Gitea) can reach, and point the repo webhook at it:
+#   https://ci.<your-domain>/push   (content-type application/json)
+#
+# For GitHub specifically you can swap `webhook` for the dedicated `github`
+# EventSource (HMAC signature verification via a secret). This generic webhook
+# works with any provider; add a secret-token check in the Sensor if needed.
+apiVersion: argoproj.io/v1alpha1
+kind: EventSource
+metadata:
+  name: git
+  namespace: argo-events
+spec:
+  service:
+    ports:
+      - { port: 12000, targetPort: 12000 }
+  webhook:
+    push:
+      port: "12000"
+      endpoint: /push
+      method: POST

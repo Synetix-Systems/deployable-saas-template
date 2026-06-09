@@ -1,0 +1,11 @@
+# Argo Events needs an EventBus (NATS) in the namespace. One per cluster.
+apiVersion: argoproj.io/v1alpha1
+kind: EventBus
+metadata:
+  name: default
+  namespace: argo-events
+spec:
+  nats:
+    native:
+      replicas: 3
+      auth: token

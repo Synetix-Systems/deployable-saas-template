@@ -1,0 +1,14 @@
+# argocd-image-updater v1.x is CR-driven — it no longer acts on Application
+# annotations by itself. This CR points it at the `app` Application and tells it
+# to honor that Application's argocd-image-updater.argoproj.io/* annotations
+# (image-list, digest strategy, helm.image-spec write-back, pull-secret).
+# Apply in the argocd namespace.
+apiVersion: argocd-image-updater.argoproj.io/v1alpha1
+kind: ImageUpdater
+metadata:
+  name: app
+  namespace: argocd
+spec:
+  applicationRefs:
+    - namePattern: "app"
+      useAnnotations: true

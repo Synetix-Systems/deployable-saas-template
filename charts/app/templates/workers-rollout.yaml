@@ -1,0 +1,70 @@
+# Celery workers — one Rollout per queue (see values.workers / celery_app
+# task_routes). No Service (no inbound traffic) → canary (surge rolling), not
+# blue-green. SIGTERM = Celery warm shutdown: the old pod finishes in-flight
+# tasks before exiting (up to terminationGracePeriodSeconds), the new pod is
+# already consuming → no dropped work.
+{{- range $name, $w := .Values.workers }}
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: worker-{{ $name }}
+  annotations: { argocd.argoproj.io/sync-wave: "2" }
+spec:
+  replicas: {{ $w.replicas }}
+  selector: { matchLabels: { app.kubernetes.io/name: worker-{{ $name }} } }
+  strategy:
+    canary:
+      maxSurge: {{ $.Values.rollouts.canary.maxSurge }}
+      maxUnavailable: {{ $.Values.rollouts.canary.maxUnavailable }}
+  template:
+    metadata: { labels: { app.kubernetes.io/name: worker-{{ $name }} } }
+    spec:
+      {{- include "app.pullSecrets" $ | nindent 6 }}
+      terminationGracePeriodSeconds: {{ $w.gracePeriod | default $.Values.workersGracePeriod }}   # MAX drain window — warm shutdown exits the instant in-flight tasks finish; this is only the SIGKILL ceiling
+      initContainers:
+        {{- include "app.waitForInfra" $ | nindent 8 }}
+      containers:
+        - name: worker
+          image: {{ include "app.image.backend" $ | quote }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          command: ["celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--concurrency={{ $w.concurrency }}", "-Q", "{{ $name }}"]
+          envFrom:
+            {{- include "app.envFrom" $ | nindent 12 }}
+          livenessProbe:
+            exec: { command: ["celery", "-A", "app.celery_app", "inspect", "ping", "-t", "5"] }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+---
+{{- end }}
+{{- if .Values.beat.enabled }}
+# Beat — singleton scheduler. canary maxSurge:0/maxUnavailable:1 = old stops
+# before new starts (never two beats = duplicate scheduled tasks). Brief
+# scheduler gap on roll; queued tasks keep being consumed by workers.
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: beat
+  annotations: { argocd.argoproj.io/sync-wave: "2" }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app.kubernetes.io/name: beat } }
+  strategy:
+    canary:
+      maxSurge: 0
+      maxUnavailable: 1
+  template:
+    metadata: { labels: { app.kubernetes.io/name: beat } }
+    spec:
+      {{- include "app.pullSecrets" . | nindent 6 }}
+      initContainers:
+        {{- include "app.waitForInfra" . | nindent 8 }}
+      containers:
+        - name: beat
+          image: {{ include "app.image.backend" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["celery", "-A", "app.celery_app", "beat", "--loglevel=info", "--scheduler", "celery.beat.PersistentScheduler", "--schedule", "/tmp/celerybeat-schedule"]
+          envFrom:
+            {{- include "app.envFrom" . | nindent 12 }}
+{{- end }}

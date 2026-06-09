@@ -1,3 +1,36 @@
+# Local development stack ONLY. Production runs on k3s via the Helm chart in
+# charts/app (see deployment.md). This file mirrors the cluster topology
+# (Postgres, Redis, MinIO, Celery workers + beat) so the app behaves the same
+# locally. Start it with `docker compose watch` (see development.md).
+
+# Shared backend env — the same image runs the API, prestart, workers, and beat.
+x-backend-env: &backend-env
+  DOMAIN: ${DOMAIN}
+  FRONTEND_HOST: ${FRONTEND_HOST?Variable not set}
+  ENVIRONMENT: ${ENVIRONMENT}
+  BACKEND_CORS_ORIGINS: ${BACKEND_CORS_ORIGINS}
+  SECRET_KEY: ${SECRET_KEY?Variable not set}
+  FIRST_SUPERUSER: ${FIRST_SUPERUSER?Variable not set}
+  FIRST_SUPERUSER_PASSWORD: ${FIRST_SUPERUSER_PASSWORD?Variable not set}
+  SMTP_HOST: ${SMTP_HOST}
+  SMTP_USER: ${SMTP_USER}
+  SMTP_PASSWORD: ${SMTP_PASSWORD}
+  EMAILS_FROM_EMAIL: ${EMAILS_FROM_EMAIL}
+  POSTGRES_SERVER: db
+  POSTGRES_PORT: ${POSTGRES_PORT}
+  POSTGRES_DB: ${POSTGRES_DB}
+  POSTGRES_USER: ${POSTGRES_USER?Variable not set}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD?Variable not set}
+  SENTRY_DSN: ${SENTRY_DSN}
+  REDIS_URL: redis://redis:6379/0
+  CELERY_BROKER_URL: redis://redis:6379/0
+  CELERY_RESULT_BACKEND: redis://redis:6379/1
+  S3_ENDPOINT_URL: http://minio:9000
+  S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-minioadmin}
+  S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-minioadmin}
+  S3_BUCKET_NAME: ${S3_BUCKET_NAME:-app}
+  S3_REGION: ${S3_REGION:-us-east-1}
+
 services:
 
   db:
@@ -19,18 +52,35 @@ services:
       - POSTGRES_USER=${POSTGRES_USER?Variable not set}
       - POSTGRES_DB=${POSTGRES_DB?Variable not set}
 
-  adminer:
-    image: adminer
+  redis:
+    image: redis:7-alpine
     restart: always
-    networks:
-      - default
-    depends_on:
-      - db
+    command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - app-redis-data:/data
+
+  minio:
+    image: minio/minio:latest
+    restart: always
+    command: ["server", "/data", "--console-address", ":9001"]
     environment:
-      - ADMINER_DESIGN=pepa-linha-dark
+      - MINIO_ROOT_USER=${S3_ACCESS_KEY_ID:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${S3_SECRET_ACCESS_KEY:-minioadmin}
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - app-minio-data:/data
 
   prestart:
-    image: '${DOCKER_IMAGE_BACKEND?Variable not set}:${TAG-latest}'
+    image: 'full-stack-fastapi-backend:${TAG-latest}'
     build:
       context: .
       dockerfile: backend/Dockerfile
@@ -40,30 +90,15 @@ services:
       db:
         condition: service_healthy
         restart: true
+      redis:
+        condition: service_healthy
     command: bash scripts/prestart.sh
     env_file:
       - .env
-    environment:
-      - DOMAIN=${DOMAIN}
-      - FRONTEND_HOST=${FRONTEND_HOST?Variable not set}
-      - ENVIRONMENT=${ENVIRONMENT}
-      - BACKEND_CORS_ORIGINS=${BACKEND_CORS_ORIGINS}
-      - SECRET_KEY=${SECRET_KEY?Variable not set}
-      - FIRST_SUPERUSER=${FIRST_SUPERUSER?Variable not set}
-      - FIRST_SUPERUSER_PASSWORD=${FIRST_SUPERUSER_PASSWORD?Variable not set}
-      - SMTP_HOST=${SMTP_HOST}
-      - SMTP_USER=${SMTP_USER}
-      - SMTP_PASSWORD=${SMTP_PASSWORD}
-      - EMAILS_FROM_EMAIL=${EMAILS_FROM_EMAIL}
-      - POSTGRES_SERVER=db
-      - POSTGRES_PORT=${POSTGRES_PORT}
-      - POSTGRES_DB=${POSTGRES_DB}
-      - POSTGRES_USER=${POSTGRES_USER?Variable not set}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD?Variable not set}
-      - SENTRY_DSN=${SENTRY_DSN}
+    environment: *backend-env
 
   backend:
-    image: '${DOCKER_IMAGE_BACKEND?Variable not set}:${TAG-latest}'
+    image: 'full-stack-fastapi-backend:${TAG-latest}'
     restart: always
     networks:
       - default
@@ -75,37 +110,54 @@ services:
         condition: service_completed_successfully
     env_file:
       - .env
-    environment:
-      - DOMAIN=${DOMAIN}
-      - FRONTEND_HOST=${FRONTEND_HOST?Variable not set}
-      - ENVIRONMENT=${ENVIRONMENT}
-      - BACKEND_CORS_ORIGINS=${BACKEND_CORS_ORIGINS}
-      - SECRET_KEY=${SECRET_KEY?Variable not set}
-      - FIRST_SUPERUSER=${FIRST_SUPERUSER?Variable not set}
-      - FIRST_SUPERUSER_PASSWORD=${FIRST_SUPERUSER_PASSWORD?Variable not set}
-      - SMTP_HOST=${SMTP_HOST}
-      - SMTP_USER=${SMTP_USER}
-      - SMTP_PASSWORD=${SMTP_PASSWORD}
-      - EMAILS_FROM_EMAIL=${EMAILS_FROM_EMAIL}
-      - POSTGRES_SERVER=db
-      - POSTGRES_PORT=${POSTGRES_PORT}
-      - POSTGRES_DB=${POSTGRES_DB}
-      - POSTGRES_USER=${POSTGRES_USER?Variable not set}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD?Variable not set}
-      - SENTRY_DSN=${SENTRY_DSN}
-
+    environment: *backend-env
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/utils/health-check/"]
       interval: 10s
       timeout: 5s
       retries: 5
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
 
+  worker:
+    image: 'full-stack-fastapi-backend:${TAG-latest}'
+    restart: always
+    networks:
+      - default
+    depends_on:
+      backend:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Local dev: one worker consumes every queue. In the cluster each queue is
+    # its own Rollout (see charts/app/values.yaml `workers`).
+    command: ["celery", "-A", "app.celery_app", "worker", "--loglevel=info", "-Q", "default,emails"]
+    env_file:
+      - .env
+    environment: *backend-env
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+
+  beat:
+    image: 'full-stack-fastapi-backend:${TAG-latest}'
+    restart: always
+    networks:
+      - default
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: ["celery", "-A", "app.celery_app", "beat", "--loglevel=info", "--scheduler", "celery.beat.PersistentScheduler", "--schedule", "/tmp/celerybeat-schedule"]
+    env_file:
+      - .env
+    environment: *backend-env
     build:
       context: .
       dockerfile: backend/Dockerfile
 
   frontend:
-    image: '${DOCKER_IMAGE_FRONTEND?Variable not set}:${TAG-latest}'
+    image: 'full-stack-fastapi-frontend:${TAG-latest}'
     restart: always
     networks:
       - default
@@ -113,7 +165,10 @@ services:
       context: .
       dockerfile: frontend/Dockerfile
       args:
-        - VITE_API_URL=https://api.${DOMAIN?Variable not set}
+        - VITE_API_URL=https://${DOMAIN?Variable not set}
         - NODE_ENV=production
+
 volumes:
   app-db-data:
+  app-redis-data:
+  app-minio-data:

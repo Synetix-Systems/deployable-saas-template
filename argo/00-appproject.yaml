@@ -1,0 +1,18 @@
+# Argo CD AppProject scoping this app. Apply once on the cluster's Argo CD
+# (lives in the argocd namespace). CHANGE the sourceRepos URL to your repo.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: app
+  namespace: argocd
+spec:
+  description: Full-stack FastAPI SaaS
+  sourceRepos:
+    - "https://github.com/your-org/your-repo*"        # ← CHANGE ME (https or ssh)
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: app
+  clusterResourceWhitelist:
+    - { group: "*", kind: "*" }        # allows Namespace creation, CRDs (Rollout) etc.
+  namespaceResourceWhitelist:
+    - { group: "*", kind: "*" }

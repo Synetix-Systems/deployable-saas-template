@@ -1,0 +1,43 @@
+# BUILD CLUSTER ONLY. On a master push, submit the app-ci Workflow with the
+# pushed ref + SHA. GitHub push payload keys: body.ref, body.after.
+# CHANGE the `repo` parameter to your repository.
+apiVersion: argoproj.io/v1alpha1
+kind: Sensor
+metadata:
+  name: app-ci
+  namespace: argo-events
+spec:
+  template:
+    serviceAccountName: operate-workflow-sa
+  dependencies:
+    - name: push
+      eventSourceName: git
+      eventName: push
+      filters:
+        data:
+          - path: body.ref
+            type: string
+            value:
+              - "refs/heads/master"
+  triggers:
+    - template:
+        name: ci
+        argoWorkflow:
+          operation: submit
+          source:
+            resource:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Workflow
+              metadata: { generateName: app-ci-, namespace: argo }
+              spec:
+                workflowTemplateRef: { name: app-ci }
+                arguments:
+                  parameters:
+                    - { name: repo, value: "github.com/your-org/your-repo" }   # ← CHANGE ME
+                    - { name: ref, value: "" }
+                    - { name: sha, value: "" }
+          parameters:
+            - src: { dependencyName: push, dataKey: body.ref }
+              dest: spec.arguments.parameters.1.value      # ref
+            - src: { dependencyName: push, dataKey: body.after }
+              dest: spec.arguments.parameters.2.value      # sha

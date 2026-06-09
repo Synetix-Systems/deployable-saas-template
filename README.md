@@ -1,30 +1,27 @@
 # Full Stack FastAPI Template
 
-<a href="https://github.com/fastapi/full-stack-fastapi-template/actions?query=workflow%3A%22Test+Docker+Compose%22" target="_blank"><img src="https://github.com/fastapi/full-stack-fastapi-template/workflows/Test%20Docker%20Compose/badge.svg" alt="Test Docker Compose"></a>
-<a href="https://github.com/fastapi/full-stack-fastapi-template/actions?query=workflow%3A%22Test+Backend%22" target="_blank"><img src="https://github.com/fastapi/full-stack-fastapi-template/workflows/Test%20Backend/badge.svg" alt="Test Backend"></a>
-<a href="https://coverage-badge.samuelcolvin.workers.dev/redirect/fastapi/full-stack-fastapi-template" target="_blank"><img src="https://coverage-badge.samuelcolvin.workers.dev/fastapi/full-stack-fastapi-template.svg" alt="Coverage"></a>
-
 ## Technology Stack and Features
 
 - ⚡ [**FastAPI**](https://fastapi.tiangolo.com) for the Python backend API.
   - 🧰 [SQLModel](https://sqlmodel.tiangolo.com) for the Python SQL database interactions (ORM).
   - 🔍 [Pydantic](https://docs.pydantic.dev), used by FastAPI, for the data validation and settings management.
-  - 💾 [PostgreSQL](https://www.postgresql.org) as the SQL database.
+  - 💾 [PostgreSQL](https://www.postgresql.org) as the SQL database, with [pgbouncer](https://www.pgbouncer.org) pooling and [WAL-G](https://wal-g.readthedocs.io) continuous backups to S3.
+  - 🥬 [Celery](https://docs.celeryq.dev) workers + beat for background and scheduled tasks, backed by [Redis](https://redis.io).
+  - 🪣 S3-compatible [object storage](https://aws.amazon.com/s3/) (MinIO locally, external bucket in production).
 - 🚀 [React](https://react.dev) for the frontend.
   - 💃 Using TypeScript, hooks, [Vite](https://vitejs.dev), and other parts of a modern frontend stack.
   - 🎨 [Tailwind CSS](https://tailwindcss.com) and [shadcn/ui](https://ui.shadcn.com) for the frontend components.
   - 🤖 An automatically generated frontend client.
   - 🧪 [Playwright](https://playwright.dev) for End-to-End testing.
   - 🦇 Dark mode support.
-- 🐋 [Docker Compose](https://www.docker.com) for development and production.
+- 🐋 [Docker Compose](https://www.docker.com) for local development.
+- ☸️ **[k3s](https://k3s.io) deployment via a [Helm](https://helm.sh) chart** ([`charts/app`](./charts/app)), delivered by [Argo CD](https://argo-cd.readthedocs.io) with [Argo Rollouts](https://argo-rollouts.readthedocs.io) blue-green/canary.
+- 🏭 GitOps CI/CD: [Argo Workflows](https://argoproj.github.io/workflows/) + [Events](https://argoproj.github.io/events/) build images to [Harbor](https://goharbor.io); [Argo Image Updater](https://argocd-image-updater.readthedocs.io) auto-rolls on new digests.
 - 🔒 Secure password hashing by default.
 - 🔑 JWT (JSON Web Token) authentication.
 - 📫 Email based password recovery.
 - 📬 [Mailcatcher](https://mailcatcher.me) for local email testing during development.
 - ✅ Tests with [Pytest](https://pytest.org).
-- 📞 [Traefik](https://traefik.io) as a reverse proxy / load balancer.
-- 🚢 Deployment instructions using Docker Compose, including how to set up a frontend Traefik proxy to handle automatic HTTPS certificates.
-- 🏭 CI (continuous integration) and CD (continuous deployment) based on GitHub Actions.
 
 ### Dashboard Login
 
@@ -216,13 +213,19 @@ Frontend docs: [frontend/README.md](./frontend/README.md).
 
 ## Deployment
 
-Deployment docs: [deployment.md](./deployment.md).
+Deploys to **k3s** via the Helm chart in [`charts/app`](./charts/app), delivered
+by Argo CD (GitOps) with Argo Rollouts. Push to `master` → build on the build
+cluster → Harbor → Argo Image Updater rolls the cluster. One environment, no
+manual steps. Full setup, bootstrap, and secrets: [deployment.md](./deployment.md).
+
+Docker Compose is **local development only** — it is not used to deploy.
 
 ## Development
 
 General development docs: [development.md](./development.md).
 
-This includes using Docker Compose, custom local domains, `.env` configurations, etc.
+This includes using Docker Compose (Postgres, Redis, MinIO, Celery workers),
+custom local domains, `.env` configurations, etc.
 
 ## Release Notes
 

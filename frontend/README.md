@@ -57,7 +57,7 @@ bash ./scripts/generate-client.sh
 
 * Start the Docker Compose stack.
 
-* Download the OpenAPI JSON file from `http://localhost/api/v1/openapi.json` and copy it to a new file `openapi.json` at the root of the `frontend` directory.
+* Download the OpenAPI JSON file from `http://localhost:8000/api/v1/openapi.json` and copy it to a new file `openapi.json` at the root of the `frontend` directory.
 
 * To generate the frontend client, run:
 
@@ -74,7 +74,7 @@ Notice that everytime the backend changes (changing the OpenAPI schema), you sho
 If you want to use a remote API, you can set the environment variable `VITE_API_URL` to the URL of the remote API. For example, you can set it in the `frontend/.env` file:
 
 ```env
-VITE_API_URL=https://api.my-domain.example.com
+VITE_API_URL=https://my-domain.example.com
 ```
 
 Then, when you run the frontend, it will use that URL as the base URL for the API.

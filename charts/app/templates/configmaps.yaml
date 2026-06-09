@@ -1,0 +1,71 @@
+# Topology env (ConfigMap) + mounted config/entrypoint scripts.
+# Secrets live in the app-dotenv Secret, created out-of-band from .env (see
+# deployment.md), NOT here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-env
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+data:
+  DOMAIN: {{ .Values.domain | quote }}
+{{- range $k, $v := .Values.env }}
+  {{ $k }}: {{ $v | quote }}
+{{- end }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-conf
+data:
+  pg_hba.conf: |
+    local   all             all                                     trust
+    host    all             all             127.0.0.1/32            scram-sha-256
+    host    all             all             ::1/128                 scram-sha-256
+    host    all             all             10.0.0.0/8              scram-sha-256
+    host    all             all             172.16.0.0/12           scram-sha-256
+    host    all             all             192.168.0.0/16          scram-sha-256
+    host    all             all             0.0.0.0/0               scram-sha-256
+---
+# Builds the pgbouncer SCRAM userlist from the live Postgres verifier, then
+# launches pgbouncer. (edoburu/pgbouncer base provides /entrypoint.sh.)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pgbouncer-entrypoint
+data:
+  pgbouncer-entrypoint.sh: |
+    #!/bin/sh
+    set -e
+    /entrypoint.sh true
+    AUTH_FILE="${AUTH_FILE:-/etc/pgbouncer/userlist.txt}"
+    DB_HOST="${DB_HOST:-db}"; DB_PORT="${DB_PORT:-5432}"
+    DB_USER="${POSTGRES_USER:-postgres}"; DB_PASS="${POSTGRES_PASSWORD:-changethis}"; DB_NAME="${POSTGRES_DB:-app}"
+    echo "Fetching SCRAM verifier for '${DB_USER}'..."
+    VERIFIER=$(PGPASSWORD="${DB_PASS}" psql -h "${DB_HOST}" -p "${DB_PORT}" -U "${DB_USER}" -d "${DB_NAME}" \
+        -t --no-align -c "SELECT passwd FROM pg_shadow WHERE usename = '${DB_USER}'" 2>/dev/null | head -1)
+    if [ -z "${VERIFIER}" ]; then echo "ERROR: no SCRAM verifier for '${DB_USER}'." >&2; exit 1; fi
+    echo "\"${DB_USER}\" \"${VERIFIER}\"" > "${AUTH_FILE}"
+    exec /usr/bin/pgbouncer /etc/pgbouncer/pgbouncer.ini
+---
+# WAL-G base-backup loop sidecar: waits for Postgres, takes an initial backup,
+# then repeats every BACKUP_SCHEDULE seconds and prunes to WALG_RETAIN_FULL.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pgbackup-entrypoint
+data:
+  pgbackup-entrypoint.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+    POSTGRES_HOST="${POSTGRES_HOST:-127.0.0.1}"; POSTGRES_PORT="${POSTGRES_PORT:-5432}"
+    BACKUP_SCHEDULE="${BACKUP_SCHEDULE:-86400}"; WALG_RETAIN_FULL="${WALG_RETAIN_FULL:-7}"
+    case "$BACKUP_SCHEDULE" in daily) INTERVAL=86400 ;; hourly) INTERVAL=3600 ;; *) INTERVAL="$BACKUP_SCHEDULE" ;; esac
+    log() { echo "[pgbackup] $(date -u '+%Y-%m-%dT%H:%M:%SZ') $*"; }
+    until pg_isready -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$POSTGRES_USER" -q; do sleep 2; done
+    run_backup() {
+      log "base backup..."; wal-g backup-push "$PGDATA" && log "ok" || { log "FAILED"; return 1; }
+      wal-g delete retain FULL "$WALG_RETAIN_FULL" --confirm || log "retention prune failed"
+    }
+    run_backup || true
+    while true; do sleep "$INTERVAL"; run_backup || true; done

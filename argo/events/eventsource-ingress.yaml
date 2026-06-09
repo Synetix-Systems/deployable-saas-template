@@ -1,0 +1,25 @@
+# Public webhook endpoint WITHOUT exposing the build server's IP — minimal
+# host-level Tailscale Funnel (no k8s operator needed):
+#
+#   1. This NodePort exposes the EventSource on the node at :30120.
+#   2. On the build server host run (once, persists):
+#        sudo tailscale funnel --bg http://localhost:30120
+#   3. GitHub repo webhook → https://<build-host>.tail41bc66.ts.net/push
+#      (content-type application/json, push events). Funnel terminates public
+#      HTTPS on Tailscale's edge — origin IP never revealed, no open ports.
+#
+# Funnel prereq: tailnet ACL grants the funnel nodeAttr to this host.
+apiVersion: v1
+kind: Service
+metadata:
+  name: git-eventsource-nodeport
+  namespace: argo-events
+spec:
+  type: NodePort
+  selector:
+    eventsource-name: git
+  ports:
+    - name: webhook
+      port: 12000
+      targetPort: 12000
+      nodePort: 30120

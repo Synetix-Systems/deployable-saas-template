@@ -1,0 +1,48 @@
+# Argo CD Application — the ONE environment. Apply on the cluster's Argo CD.
+#
+# Flow: push to master → Argo Workflows (build cluster) builds backend/frontend
+# images, pushes Harbor :latest + :<sha> → Argo Image Updater watches the
+# :latest DIGEST over the tailnet → on change writes the digest-pinned ref into
+# image.<svc>.image (write-back-method: argocd, stored on this Application) →
+# Argo CD syncs → the Rollout rolls (blue-green backend/frontend, canary workers).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app
+  namespace: argocd
+  annotations:
+    # Harbor over the tailnet (host tailscaled + MagicDNS → pods resolve ts.net).
+    # CHANGE the project path (your-project) to match your Harbor project.
+    argocd-image-updater.argoproj.io/image-list: >-
+      backend=harbor.tail41bc66.ts.net/your-project/backend:latest,
+      frontend=harbor.tail41bc66.ts.net/your-project/frontend:latest
+    argocd-image-updater.argoproj.io/backend.update-strategy: digest
+    argocd-image-updater.argoproj.io/frontend.update-strategy: digest
+    argocd-image-updater.argoproj.io/backend.helm.image-spec: image.backend.image
+    argocd-image-updater.argoproj.io/frontend.helm.image-spec: image.frontend.image
+    argocd-image-updater.argoproj.io/write-back-method: argocd
+    # Registry is user/password secured → Updater reads creds from this secret.
+    argocd-image-updater.argoproj.io/backend.pull-secret: pullsecret:argocd/regcred
+    argocd-image-updater.argoproj.io/frontend.pull-secret: pullsecret:argocd/regcred
+spec:
+  project: app
+  source:
+    repoURL: "https://github.com/your-org/your-repo.git"   # ← CHANGE ME
+    targetRevision: master
+    path: charts/app
+    helm:
+      valueFiles:
+        - values.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: app
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ApplyOutOfSyncOnly=true
+    retry:
+      limit: 5
+      backoff: { duration: 10s, factor: 2, maxDuration: 3m }

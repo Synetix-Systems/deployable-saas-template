@@ -68,6 +68,22 @@ class Settings(BaseSettings):
             path=self.POSTGRES_DB,
         )
 
+    # Redis — Celery broker + result backend. In-cluster the chart points these
+    # at the bundled `redis` Service; locally Docker Compose runs a `redis`
+    # service. DB 0 = broker, DB 1 = results.
+    REDIS_URL: str = "redis://localhost:6379/0"
+    CELERY_BROKER_URL: str = "redis://localhost:6379/0"
+    CELERY_RESULT_BACKEND: str = "redis://localhost:6379/1"
+
+    # S3-compatible object storage (used by app uploads AND WAL-G DB backups).
+    # Defaults target a local MinIO; in production point at an external bucket
+    # (AWS S3, Backblaze B2, etc.). Leave S3_ENDPOINT_URL empty for real AWS S3.
+    S3_ENDPOINT_URL: str = "http://localhost:9000"
+    S3_ACCESS_KEY_ID: str = "minioadmin"
+    S3_SECRET_ACCESS_KEY: str = "minioadmin"
+    S3_BUCKET_NAME: str = "app"
+    S3_REGION: str = "us-east-1"
+
     SMTP_TLS: bool = True
     SMTP_SSL: bool = False
     SMTP_PORT: int = 587

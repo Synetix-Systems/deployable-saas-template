@@ -1,5 +1,10 @@
 # FastAPI Project - Development
 
+> Docker Compose is for **local development only**. Production runs on k3s via
+> the Helm chart in [`charts/app`](charts/app) — see [deployment.md](deployment.md).
+> The compose stack mirrors the cluster topology (Postgres, Redis, MinIO,
+> Celery workers + beat) so the app behaves the same locally.
+
 ## Docker Compose
 
 * Start the local stack with Docker Compose:
@@ -15,10 +20,6 @@ Frontend, built with Docker, with routes handled based on the path: <http://loca
 Backend, JSON based web API based on OpenAPI: <http://localhost:8000>
 
 Automatic interactive documentation with Swagger UI (from the OpenAPI backend): <http://localhost:8000/docs>
-
-Adminer, database web administration: <http://localhost:8080>
-
-Traefik UI, to see how the routes are being handled by the proxy: <http://localhost:8090>
 
 **Note**: The first time you start your stack, it might take a minute for it to be ready. While the backend waits for the database to be ready and configures everything. You can check the logs to monitor it.
 
@@ -45,6 +46,17 @@ This is useful for:
 * Debugging email-related functionality without sending real emails
 
 The backend is automatically configured to use Mailcatcher when running with Docker Compose locally (SMTP on port 1025). All captured emails can be viewed at <http://localhost:1080>.
+
+## Background tasks (Celery), Redis, and object storage
+
+The stack runs the same infra the cluster does:
+
+* **Redis** — Celery broker + result backend (<localhost:6379>).
+* **worker** — a Celery worker consuming the `default` + `emails` queues. In the cluster each queue is its own Rollout; locally one worker handles both.
+* **beat** — the Celery scheduler firing periodic tasks (see `beat_schedule` in `backend/app/celery_app.py`).
+* **MinIO** — local S3-compatible object storage. API at <http://localhost:9000>, web console at <http://localhost:9001> (login `minioadmin` / `minioadmin`). In production this points at an external S3 bucket instead.
+
+Task code lives in `backend/app/tasks/` (`example.py`, `email.py` — replace with your own). Enqueue from the API with e.g. `add.delay(2, 3)`. The S3 helper is `backend/app/core/storage.py`.
 
 ## Local Development
 
@@ -79,37 +91,9 @@ cd backend
 fastapi dev app/main.py
 ```
 
-## Docker Compose in `localhost.tiangolo.com`
-
-When you start the Docker Compose stack, it uses `localhost` by default, with different ports for each service (backend, frontend, adminer, etc).
-
-When you deploy it to production (or staging), it will deploy each service in a different subdomain, like `api.example.com` for the backend and `dashboard.example.com` for the frontend.
-
-In the guide about [deployment](deployment.md) you can read about Traefik, the configured proxy. That's the component in charge of transmitting traffic to each service based on the subdomain.
-
-If you want to test that it's all working locally, you can edit the local `.env` file, and change:
-
-```dotenv
-DOMAIN=localhost.tiangolo.com
-```
-
-That will be used by the Docker Compose files to configure the base domain for the services.
-
-Traefik will use this to transmit traffic at `api.localhost.tiangolo.com` to the backend, and traffic at `dashboard.localhost.tiangolo.com` to the frontend.
-
-The domain `localhost.tiangolo.com` is a special domain that is configured (with all its subdomains) to point to `127.0.0.1`. This way you can use that for your local development.
-
-After you update it, run again:
-
-```bash
-docker compose watch
-```
-
-When deploying, for example in production, the main Traefik is configured outside of the Docker Compose files. For local development, there's an included Traefik in `compose.override.yml`, just to let you test that the domains work as expected, for example with `api.localhost.tiangolo.com` and `dashboard.localhost.tiangolo.com`.
-
 ## Docker Compose files and env vars
 
-There is a main `compose.yml` file with all the configurations that apply to the whole stack, it is used automatically by `docker compose`.
+There is a main `docker-compose.yml` file with all the configurations that apply to the whole stack, it is used automatically by `docker compose`.
 
 And there's also a `compose.override.yml` with overrides for development, for example to mount the source code as a volume. It is used automatically by `docker compose` to apply overrides on top of `compose.yml`.
 
@@ -182,7 +166,8 @@ biome check..............................................................Passed
 
 ## URLs
 
-The production or staging URLs would use these same paths, but with your own domain.
+The production URLs use these same paths with your own domain — see
+[deployment.md](deployment.md).
 
 ### Development URLs
 
@@ -196,26 +181,6 @@ Automatic Interactive Docs (Swagger UI): <http://localhost:8000/docs>
 
 Automatic Alternative Docs (ReDoc): <http://localhost:8000/redoc>
 
-Adminer: <http://localhost:8080>
-
-Traefik UI: <http://localhost:8090>
-
 MailCatcher: <http://localhost:1080>
 
-### Development URLs with `localhost.tiangolo.com` Configured
-
-Development URLs, for local development.
-
-Frontend: <http://dashboard.localhost.tiangolo.com>
-
-Backend: <http://api.localhost.tiangolo.com>
-
-Automatic Interactive Docs (Swagger UI): <http://api.localhost.tiangolo.com/docs>
-
-Automatic Alternative Docs (ReDoc): <http://api.localhost.tiangolo.com/redoc>
-
-Adminer: <http://localhost.tiangolo.com:8080>
-
-Traefik UI: <http://localhost.tiangolo.com:8090>
-
-MailCatcher: <http://localhost.tiangolo.com:1080>
+MinIO console: <http://localhost:9001>
