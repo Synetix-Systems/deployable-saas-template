@@ -2,12 +2,13 @@ apiVersion: v2
 name: app
 description: >-
   Full-stack FastAPI SaaS template — backend (FastAPI), frontend (React/nginx),
-  Celery workers + beat, and infra (Postgres+WAL-G, pgbouncer, redis). Argo
+  Celery workers + beat, and infra (CloudNativePG + pooler, SeaweedFS, redis). Argo
   Rollouts blue-green for the web tiers, canary for workers. Targets k3s.
 type: application
 version: 0.1.0
 appVersion: "1.0"
 # Deployed by Argo CD (see ../../argo/application.yaml). Requires the Argo
-# Rollouts CRDs (argoproj.io/v1alpha1 Rollout) in the cluster — infra
-# (db/redis/pgbouncer) stays plain StatefulSet/Deployment; only the app
+# Rollouts CRDs (argoproj.io/v1alpha1 Rollout) and the CNPG operator + Barman
+# Cloud plugin (../../argo/cnpg-operator.yaml) — infra (db/redis/seaweedfs) is CNPG
+# CRs + plain Deployments; only the app
 # workloads (backend/frontend/workers/beat) are Rollouts.

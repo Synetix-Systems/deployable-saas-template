@@ -2,7 +2,7 @@
 
 > Docker Compose is for **local development only**. Production runs on k3s via
 > the Helm chart in [`charts/app`](charts/app) — see [deployment.md](deployment.md).
-> The compose stack mirrors the cluster topology (Postgres, Redis, MinIO,
+> The compose stack mirrors the cluster topology (Postgres, Redis, SeaweedFS,
 > Celery workers + beat) so the app behaves the same locally.
 
 ## Docker Compose
@@ -54,7 +54,7 @@ The stack runs the same infra the cluster does:
 * **Redis** — Celery broker + result backend (<localhost:6379>).
 * **worker** — a Celery worker consuming the `default` + `emails` queues. In the cluster each queue is its own Rollout; locally one worker handles both.
 * **beat** — the Celery scheduler firing periodic tasks (see `beat_schedule` in `backend/app/celery_app.py`).
-* **MinIO** — local S3-compatible object storage. API at <http://localhost:9000>, web console at <http://localhost:9001> (login `minioadmin` / `minioadmin`). In production this points at an external S3 bucket instead.
+* **SeaweedFS** — local S3-compatible object storage. S3 API at <http://localhost:8333> (keys `admin` / `adminadmin`), filer web UI at <http://localhost:8888> (buckets are under `/buckets`). In production this points at an external S3 bucket instead.
 
 Task code lives in `backend/app/tasks/` (`example.py`, `email.py` — replace with your own). Enqueue from the API with e.g. `add.delay(2, 3)`. The S3 helper is `backend/app/core/storage.py`.
 
@@ -183,4 +183,4 @@ Automatic Alternative Docs (ReDoc): <http://localhost:8000/redoc>
 
 MailCatcher: <http://localhost:1080>
 
-MinIO console: <http://localhost:9001>
+SeaweedFS filer UI: <http://localhost:8888>

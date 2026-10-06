@@ -1,115 +1,103 @@
-apiVersion: v1
-kind: Service
+# CloudNativePG cluster + PgBouncer pooler + continuous backup to S3.
+# Needs the CNPG operator and the Barman Cloud plugin (argo/cnpg-operator.yaml).
+#
+# Services the operator makes: db-rw (primary), db-ro, db-r, pgbouncer (pooler).
+# Credentials: the operator generates Secret db-app (username/password); app
+# pods read it via app.dbEnv — no POSTGRES_PASSWORD in app-dotenv.
+#
+# Backups: WAL is archived continuously + a daily base backup → any point in
+# time inside `backup.retention` is restorable. Restore = db.restore (see
+# deployment.md "Database restore").
+{{- $db := .Values.db }}
+{{- if and $db.restore.fromServerName (eq $db.restore.fromServerName $db.serverName) }}
+{{- fail "db.restore.fromServerName must differ from db.serverName — bump db.serverName so the restored cluster archives to a new folder" }}
+{{- end }}
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
 metadata:
-  name: db
+  name: db-backup
 spec:
-  clusterIP: None
-  selector:
-    app.kubernetes.io/name: db
-  ports:
-    - { name: postgres, port: 5432, targetPort: 5432 }
+  retentionPolicy: {{ .Values.backup.retention | quote }}
+  configuration:
+    destinationPath: {{ .Values.backup.destinationPath | quote }}
+    {{- if .Values.backup.endpointURL }}
+    endpointURL: {{ .Values.backup.endpointURL | quote }}
+    {{- end }}
+    s3Credentials:
+      accessKeyId: { name: {{ .Values.backup.credentialsSecret }}, key: S3_ACCESS_KEY_ID }
+      secretAccessKey: { name: {{ .Values.backup.credentialsSecret }}, key: S3_SECRET_ACCESS_KEY }
+    wal: { compression: gzip, maxParallel: 2 }
+    data: { compression: gzip }
 ---
-apiVersion: apps/v1
-kind: StatefulSet
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
 metadata:
   name: db
 spec:
-  serviceName: db
-  replicas: 1
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: db
-  template:
-    metadata:
-      labels:
-        app.kubernetes.io/name: db
-    spec:
-      {{- include "app.pullSecrets" . | nindent 6 }}
-      containers:
-        - name: postgres
-          image: {{ include "app.image.postgres" . | quote }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
-          args:
-            - postgres
-            - -c
-            - hba_file=/etc/postgresql/pg_hba.conf
-            - -c
-            - wal_level=replica
-            - -c
-            - archive_mode=on
-            - -c
-            - archive_command=wal-g wal-push %p
-            - -c
-            - archive_timeout=60
-            - -c
-            - max_wal_senders=3
-            - -c
-            - wal_keep_size=256
-            # Auto-kill sessions stuck "idle in transaction" — they hold locks
-            # that queue migrations and all traffic behind them.
-            - -c
-            - idle_in_transaction_session_timeout=300000
-          ports: [{ containerPort: 5432 }]
-          env:
-            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
-            - { name: POSTGRES_USER, valueFrom: { configMapKeyRef: { name: app-env, key: POSTGRES_USER } } }
-            - { name: POSTGRES_DB,   valueFrom: { configMapKeyRef: { name: app-env, key: POSTGRES_DB } } }
-            - { name: POSTGRES_PASSWORD, valueFrom: { secretKeyRef: { name: app-dotenv, key: POSTGRES_PASSWORD } } }
-            # WAL-G archiving target (external S3).
-            - { name: WALG_S3_PREFIX, value: {{ .Values.walg.s3Prefix | quote }} }
-            - { name: AWS_ENDPOINT, value: {{ .Values.walg.endpoint | quote }} }
-            - { name: AWS_S3_FORCE_PATH_STYLE, value: {{ .Values.walg.forcePathStyle | quote }} }
-            - { name: AWS_ACCESS_KEY_ID, valueFrom: { secretKeyRef: { name: app-dotenv, key: S3_ACCESS_KEY_ID } } }
-            - { name: AWS_SECRET_ACCESS_KEY, valueFrom: { secretKeyRef: { name: app-dotenv, key: S3_SECRET_ACCESS_KEY } } }
-            - { name: AWS_REGION, value: {{ .Values.env.S3_REGION | quote }} }
-            - { name: WALG_COMPRESSION_METHOD, value: {{ .Values.walg.compression | quote }} }
-            - { name: WALG_UPLOAD_CONCURRENCY, value: {{ .Values.walg.uploadConcurrency | quote }} }
-            - { name: WALG_RETAIN_FULL, value: {{ .Values.walg.retainFull | quote }} }
-          volumeMounts:
-            - { name: pgdata, mountPath: /var/lib/postgresql/data }
-            - { name: pg-hba, mountPath: /etc/postgresql/pg_hba.conf, subPath: pg_hba.conf, readOnly: true }
-          readinessProbe:
-            exec:
-              command: ["/bin/sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" && psql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -c 'SELECT 1' -q --no-align --tuples-only | grep -q 1"]
-            initialDelaySeconds: 10
-            periodSeconds: 10
-            timeoutSeconds: 10
-            failureThreshold: 6
-          livenessProbe:
-            exec: { command: ["pg_isready", "-U", "postgres"] }
-            initialDelaySeconds: 30
-            periodSeconds: 15
-        - name: pgbackup
-          image: {{ include "app.image.postgres" . | quote }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command: ["/bin/bash", "/pgbackup-entrypoint.sh"]
-          env:
-            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
-            - { name: POSTGRES_HOST, value: "127.0.0.1" }
-            - { name: POSTGRES_PORT, value: "5432" }
-            - { name: POSTGRES_USER, valueFrom: { configMapKeyRef: { name: app-env, key: POSTGRES_USER } } }
-            - { name: POSTGRES_DB,   valueFrom: { configMapKeyRef: { name: app-env, key: POSTGRES_DB } } }
-            - { name: BACKUP_SCHEDULE, value: {{ .Values.walg.backupSchedule | quote }} }
-            - { name: WALG_S3_PREFIX, value: {{ .Values.walg.s3Prefix | quote }} }
-            - { name: AWS_ENDPOINT, value: {{ .Values.walg.endpoint | quote }} }
-            - { name: AWS_S3_FORCE_PATH_STYLE, value: {{ .Values.walg.forcePathStyle | quote }} }
-            - { name: AWS_ACCESS_KEY_ID, valueFrom: { secretKeyRef: { name: app-dotenv, key: S3_ACCESS_KEY_ID } } }
-            - { name: AWS_SECRET_ACCESS_KEY, valueFrom: { secretKeyRef: { name: app-dotenv, key: S3_SECRET_ACCESS_KEY } } }
-            - { name: AWS_REGION, value: {{ .Values.env.S3_REGION | quote }} }
-            - { name: WALG_COMPRESSION_METHOD, value: {{ .Values.walg.compression | quote }} }
-            - { name: WALG_UPLOAD_CONCURRENCY, value: {{ .Values.walg.uploadConcurrency | quote }} }
-            - { name: WALG_RETAIN_FULL, value: {{ .Values.walg.retainFull | quote }} }
-          volumeMounts:
-            - { name: pgdata, mountPath: /var/lib/postgresql/data }
-            - { name: pgbackup-script, mountPath: /pgbackup-entrypoint.sh, subPath: pgbackup-entrypoint.sh, readOnly: true }
-      volumes:
-        - { name: pg-hba, configMap: { name: postgres-conf } }
-        - { name: pgbackup-script, configMap: { name: pgbackup-entrypoint, defaultMode: 0755 } }
-  volumeClaimTemplates:
-    - metadata: { name: pgdata }
-      spec:
-        accessModes: ["ReadWriteOnce"]
-        {{- if .Values.storage.storageClass }}
-        storageClassName: {{ .Values.storage.storageClass | quote }}
-        {{- end }}
-        resources: { requests: { storage: {{ .Values.storage.dbSize }} } }
+  instances: {{ $db.instances }}
+  imageName: {{ $db.image | quote }}
+  storage:
+    size: {{ .Values.storage.dbSize }}
+    {{- if .Values.storage.storageClass }}
+    storageClass: {{ .Values.storage.storageClass | quote }}
+    {{- end }}
+  postgresql:
+    parameters:
+      # Auto-kill sessions stuck "idle in transaction" — they hold locks that
+      # queue migrations and all traffic behind them.
+      idle_in_transaction_session_timeout: "300000"
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: db-backup
+        serverName: {{ $db.serverName | quote }}
+  bootstrap:
+    {{- if $db.restore.fromServerName }}
+    recovery:
+      source: origin
+      database: {{ .Values.env.POSTGRES_DB }}
+      owner: {{ .Values.env.POSTGRES_DB }}
+      {{- if $db.restore.targetTime }}
+      recoveryTarget:
+        targetTime: {{ $db.restore.targetTime | quote }}
+      {{- end }}
+  externalClusters:
+    - name: origin
+      plugin:
+        name: barman-cloud.cloudnative-pg.io
+        parameters:
+          barmanObjectName: db-backup
+          serverName: {{ $db.restore.fromServerName | quote }}
+    {{- else }}
+    initdb:
+      database: {{ .Values.env.POSTGRES_DB }}
+      owner: {{ .Values.env.POSTGRES_DB }}
+    {{- end }}
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: db-daily
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  immediate: true                    # first base backup right after creation
+  backupOwnerReference: self
+  cluster: { name: db }
+  method: plugin
+  pluginConfiguration: { name: barman-cloud.cloudnative-pg.io }
+---
+# Transaction pooling for the app. Migrations bypass it (prestart → db-rw).
+apiVersion: postgresql.cnpg.io/v1
+kind: Pooler
+metadata:
+  name: pgbouncer
+spec:
+  cluster: { name: db }
+  instances: 1
+  type: rw
+  pgbouncer:
+    poolMode: transaction
+    parameters:
+      max_client_conn: "200"
+      default_pool_size: "20"

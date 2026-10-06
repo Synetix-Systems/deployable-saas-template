@@ -42,11 +42,11 @@ services:
     ports:
       - "6379:6379"
 
-  minio:
+  seaweedfs:
     restart: "no"
     ports:
-      - "9000:9000"   # S3 API
-      - "9001:9001"   # web console
+      - "8333:8333"   # S3 API
+      - "8888:8888"   # filer web UI (browse buckets under /buckets)
 
   # Workers/beat reuse the backend image; sync code + use mailcatcher locally.
   worker:

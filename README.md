@@ -5,9 +5,9 @@
 - ⚡ [**FastAPI**](https://fastapi.tiangolo.com) for the Python backend API.
   - 🧰 [SQLModel](https://sqlmodel.tiangolo.com) for the Python SQL database interactions (ORM).
   - 🔍 [Pydantic](https://docs.pydantic.dev), used by FastAPI, for the data validation and settings management.
-  - 💾 [PostgreSQL](https://www.postgresql.org) as the SQL database, with [pgbouncer](https://www.pgbouncer.org) pooling and [WAL-G](https://wal-g.readthedocs.io) continuous backups to S3.
+  - 💾 [PostgreSQL](https://www.postgresql.org) as the SQL database, run by [CloudNativePG](https://cloudnative-pg.io) with PgBouncer pooling and continuous backups (point-in-time restore) to S3.
   - 🥬 [Celery](https://docs.celeryq.dev) workers + beat for background and scheduled tasks, backed by [Redis](https://redis.io).
-  - 🪣 S3-compatible [object storage](https://aws.amazon.com/s3/) (MinIO locally, external bucket in production).
+  - 🪣 S3-compatible [object storage](https://aws.amazon.com/s3/) ([SeaweedFS](https://github.com/seaweedfs/seaweedfs), locally and in the cluster).
 - 🚀 [React](https://react.dev) for the frontend.
   - 💃 Using TypeScript, hooks, [Vite](https://vitejs.dev), and other parts of a modern frontend stack.
   - 🎨 [Tailwind CSS](https://tailwindcss.com) and [shadcn/ui](https://ui.shadcn.com) for the frontend components.
@@ -224,7 +224,7 @@ Docker Compose is **local development only** — it is not used to deploy.
 
 General development docs: [development.md](./development.md).
 
-This includes using Docker Compose (Postgres, Redis, MinIO, Celery workers),
+This includes using Docker Compose (Postgres, Redis, SeaweedFS, Celery workers),
 custom local domains, `.env` configurations, etc.
 
 ## Release Notes

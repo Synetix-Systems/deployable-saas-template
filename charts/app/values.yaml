@@ -19,9 +19,6 @@ image:
     repo: your-project/frontend       # CHANGE ME
     tag: latest
     image: ""                         # full ref — Argo Image Updater writes here
-  postgres:
-    repo: your-project/postgres       # CHANGE ME — custom postgres+WAL-G image
-    tag: latest                       # rebuilt by CI; not auto-updated by Image Updater
 
 # Public host. Single host, path routing: /api → backend, / → frontend.
 domain: app.example.com               # CHANGE ME
@@ -68,35 +65,51 @@ beat:
 storage:
   dbSize: 20Gi
   redisSize: 5Gi
+  seaweedfsSize: 20Gi
   storageClass: ""                    # "" = cluster default (k3s local-path)
 
-# WAL-G continuous archiving + scheduled base backups to an EXTERNAL S3 bucket.
-# Set the bucket/endpoint here; credentials come from the app-dotenv Secret
-# (S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY).
-walg:
-  s3Prefix: s3://your-bucket/walg     # CHANGE ME
-  endpoint: ""                        # empty = real AWS S3; set for B2/MinIO/etc.
-  forcePathStyle: "true"              # "true" for MinIO/B2, "false" for AWS S3
-  retainFull: "7"
-  uploadConcurrency: "2"
-  compression: lz4
-  backupSchedule: "86400"             # seconds between base backups (86400 = daily)
+# CloudNativePG cluster (templates/db.yaml). Needs argo/cnpg-operator.yaml.
+db:
+  instances: 1                        # >1 = streaming replicas + automatic failover
+  image: ghcr.io/cloudnative-pg/postgresql:18
+  # Folder for this cluster's WAL + base backups inside backup.destinationPath.
+  # Bump it (db-2, db-3, ...) on every restore — a new timeline needs an empty folder.
+  serverName: db
+  # Point-in-time restore. Bootstrap only runs when the Cluster is CREATED, so
+  # setting this alone does nothing — follow deployment.md "Database restore".
+  restore:
+    fromServerName: ""                # serverName to restore FROM ("" = fresh initdb)
+    targetTime: ""                    # RFC3339, e.g. "2026-10-05T14:30:00Z"; "" = latest WAL
+
+# CNPG backups (Barman Cloud plugin): continuous WAL archive + scheduled base
+# backups. Credentials Secret must hold S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY.
+backup:
+  destinationPath: s3://backups       # bucket (+ optional prefix)
+  endpointURL: http://seaweedfs:8333     # "" = real AWS S3; off-site B2/S3 for real DR
+  credentialsSecret: app-dotenv
+  retention: 30d                      # PITR window; older base backups + WAL pruned
+  schedule: "0 0 3 * * *"             # six-field cron (sec first) — 03:00 daily
+
+# In-cluster SeaweedFS (templates/seaweedfs.yaml): app uploads + backup target.
+seaweedfs:
+  enabled: true
+  image: chrislusf/seaweedfs:4.48
+  buckets: [app, backups]             # must include env.S3_BUCKET_NAME + backup bucket
 
 # Non-secret topology env (ConfigMap, LAST in envFrom → overrides the .env
 # Secret). Only put here: (1) topology the chart must force (service
-# hostnames/ports), (2) keys other templates read via configMapKeyRef
-# (POSTGRES_USER/DB) or render directly (S3 region/bucket in WAL-G env).
+# hostnames/ports), (2) keys other templates read (POSTGRES_DB = CNPG db + owner).
+# POSTGRES_USER/PASSWORD come from the CNPG Secret db-app (app.dbEnv).
 # User prefs (PROJECT_NAME, SMTP_*, API keys) stay OUT — they come from the Secret.
 env:
   ENVIRONMENT: production
-  POSTGRES_SERVER: pgbouncer          # app talks to the pooler, not Postgres directly
-  POSTGRES_PORT: "6432"
+  POSTGRES_SERVER: pgbouncer          # CNPG Pooler; prestart overrides to db-rw
+  POSTGRES_PORT: "5432"
   POSTGRES_DB: app
-  POSTGRES_USER: postgres
   REDIS_URL: redis://redis:6379/0
   CELERY_BROKER_URL: redis://redis:6379/0
   CELERY_RESULT_BACKEND: redis://redis:6379/1
-  S3_ENDPOINT_URL: ""                 # empty = real AWS S3; set for B2/MinIO/etc.
+  S3_ENDPOINT_URL: http://seaweedfs:8333  # in-chart SeaweedFS; "" = real AWS S3
   S3_BUCKET_NAME: app
   S3_REGION: us-east-1
   FRONTEND_HOST: https://app.example.com          # CHANGE ME (matches domain)

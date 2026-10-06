@@ -11,7 +11,7 @@ Two machines on a Tailscale tailnet:
 
 | Machine | Cluster context | Runs |
 |---|---|---|
-| **App server** | `app` | k3s + Traefik, Argo CD + Image Updater + Argo Rollouts, the app + infra (Postgres/Redis/pgbouncer), **Harbor registry** |
+| **App server** | `app` | k3s + Traefik, Argo CD + Image Updater + Argo Rollouts, CNPG operator + Barman Cloud plugin, the app + infra (CNPG Postgres + pooler, Redis, SeaweedFS), **Harbor registry** |
 | **Build server** | `build` | k3s, Argo Workflows + Events, buildkitd (may be powered off when idle) |
 
 ```
@@ -30,7 +30,7 @@ GitHub push (master) ──webhook──▶ BUILD SERVER
 
 - **Config comes from GitHub** — Argo CD watches `charts/app` on `master`.
 - **Images come from Harbor** over the tailnet.
-- The app server runs its own Postgres/Redis — one database, one environment.
+- The app server runs its own Postgres (CloudNativePG), Redis, and SeaweedFS — one database, one environment.
 
 ## Helm chart (`charts/app/`)
 
@@ -42,8 +42,10 @@ GitHub push (master) ──webhook──▶ BUILD SERVER
 | backend, frontend | blueGreen (active + `-preview` Services) | Ingress targets the active Service |
 | worker-{default,emails} | canary, maxSurge 1 / maxUnavailable 0 | Celery warm shutdown finishes in-flight tasks (grace `workersGracePeriod`, 600s) |
 | beat | canary, maxSurge 0 / maxUnavailable 1 | singleton scheduler — never two beats |
-| db (StatefulSet) | — | postgres + **pgbackup sidecar** (WAL-G) in one pod (`2/2`), shared PGDATA volume |
-| redis, pgbouncer | plain Deployments | pinned images, no auto-update |
+| db (CNPG `Cluster`) | — | operator-managed Postgres 18. Services `db-rw` / `db-ro`. Credentials in Secret `db-app` (generated). |
+| pgbouncer (CNPG `Pooler`) | — | transaction pooling, port 5432. The app connects here. |
+| backups (`ObjectStore` + `ScheduledBackup`) | — | continuous WAL archive + daily base backup to `backup.destinationPath`. 30-day point-in-time restore window. |
+| redis, seaweedfs | plain Deployments | pinned images, no auto-update |
 
 Argo CD **sync waves**: infra (0) → `prestart` Job (1, Sync hook, re-created
 every sync — runs alembic migrations + seeds the superuser) → app Rollouts (2).
@@ -53,6 +55,8 @@ every sync — runs alembic migrations + seeds the superuser) → app Rollouts (
 Install on the **app** cluster:
 
 - k3s (ships Traefik + `local-path` storage).
+- [cert-manager](https://cert-manager.io/) (the Barman Cloud plugin needs it).
+- `kubectl apply -f argo/cnpg-operator.yaml` — the CNPG operator and the Barman Cloud plugin. Wait until both Applications are healthy before you apply the app Application.
 - [Argo CD](https://argo-cd.readthedocs.io/), [Argo Rollouts](https://argo-rollouts.readthedocs.io/) CRDs + controller, [Argo Image Updater](https://argocd-image-updater.readthedocs.io/) (v1.x, CR-driven).
 - `kubectl apply -f argo/coredns-custom.yaml` then `kubectl -n kube-system rollout restart deploy/coredns` (lets pods resolve `*.ts.net` Harbor).
 
@@ -75,9 +79,12 @@ Create these out-of-band (never committed):
 | repo credential | `argocd` | app | Argo CD repo access (label `argocd.argoproj.io/secret-type: repository`) |
 
 `app-dotenv` is the **default home for all secret env** — `SECRET_KEY`,
-`POSTGRES_PASSWORD`, `FIRST_SUPERUSER*`, `PROJECT_NAME` (required by pydantic —
-no default!), SMTP, `S3_ACCESS_KEY_ID`/`S3_SECRET_ACCESS_KEY`, etc. Create it
-from an env file:
+`FIRST_SUPERUSER*`, `PROJECT_NAME` (required by pydantic — no default!), SMTP,
+`S3_ACCESS_KEY_ID`/`S3_SECRET_ACCESS_KEY`, etc. The S3 keys are also the SeaweedFS
+S3 admin credentials and the backup credentials. Do not put `POSTGRES_USER` or
+`POSTGRES_PASSWORD` in it. The CNPG operator generates them in Secret `db-app`,
+and the chart injects them into each app pod. Create `app-dotenv` from an env
+file:
 
 ```bash
 kubectl --context app -n app create secret generic app-dotenv \
@@ -103,7 +110,7 @@ second → the ConfigMap wins on conflicts.**
   1. topology the chart must force (`POSTGRES_SERVER=pgbouncer`, `REDIS_URL`,
      `S3_ENDPOINT_URL`, domain/CORS) — your local `.env` may say `localhost`,
      the cluster value must win;
-  2. keys other templates read (`POSTGRES_USER`/`POSTGRES_DB`, `S3_REGION`).
+  2. keys other templates read (`POSTGRES_DB` — the CNPG database and owner name).
 
   Putting a user preference here silently overrides the Secret. Keep prefs out.
 - Secret changes do NOT restart pods. After editing: re-sync the app (re-runs
@@ -113,7 +120,7 @@ second → the ConfigMap wins on conflicts.**
 
 Search the placeholders and replace:
 
-- `charts/app/values.yaml` — `domain`, `image.*.repo` (Harbor project path), `walg.s3Prefix`, `S3_*`, `FRONTEND_HOST`, `BACKEND_CORS_ORIGINS`.
+- `charts/app/values.yaml` — `domain`, `image.*.repo` (Harbor project path), `backup.*` (off-site target, see below), `S3_*`, `FRONTEND_HOST`, `BACKEND_CORS_ORIGINS`.
 - `argo/application.yaml` + `argo/00-appproject.yaml` — `repoURL`/`sourceRepos`, the Harbor `your-project` path in the image-list.
 - `argo/workflows/ci-workflowtemplate.yaml` + `argo/events/sensor.yaml` — `repo` and the `your-project/*` image paths.
 
@@ -159,6 +166,73 @@ crane copy harbor.tail41bc66.ts.net/your-project/backend:<old-sha> \
 ```
 
 (Or `git revert` + normal pipeline.)
+
+An image rollback does not undo a migration. If a release damaged data, also
+do a database restore (below).
+
+## Database backups and restore
+
+CloudNativePG archives each WAL segment to `backup.destinationPath` and takes
+a base backup every day at 03:00 UTC. Thus you can restore the database to any
+second inside the `backup.retention` window (default 30 days).
+
+> **Warning:** The default target is the in-cluster SeaweedFS. SeaweedFS uses the same
+> node and disk as Postgres. This target protects against bad migrations and
+> deleted rows. It does not protect against the loss of the node. For disaster
+> recovery, set `backup.endpointURL`, `backup.destinationPath`, and
+> `backup.credentialsSecret` to an off-site bucket (AWS S3, Backblaze B2).
+
+### Check the backups
+
+```bash
+kubectl --context app -n app get backups                    # base backups
+kubectl --context app -n app get objectstore db-backup -o yaml   # status.serverRecoveryWindow = first/last restorable time
+kubectl --context app -n app get cluster db                 # STATUS "Cluster in healthy state"
+```
+
+### Take a backup now (before a risky change)
+
+```bash
+kubectl --context app -n app create -f - <<'YAML'
+apiVersion: postgresql.cnpg.io/v1
+kind: Backup
+metadata: { generateName: db-manual- }
+spec:
+  cluster: { name: db }
+  method: plugin
+  pluginConfiguration: { name: barman-cloud.cloudnative-pg.io }
+YAML
+```
+
+### Restore to a point in time
+
+A restore replaces the live database. CNPG reads `bootstrap` only when it
+creates the `Cluster`. Thus you must delete the `Cluster` after you change the
+values.
+
+> **Warning:** Step 5 deletes the database and its volumes. Do step 1 first.
+> Make sure that the target time is inside the recovery window.
+
+1. Run the commands in "Check the backups". Write down the current `db.serverName` and the recovery window.
+2. In `charts/app/values.yaml`, set `db.restore.fromServerName` to the current `db.serverName` (for example `db`).
+3. Set `db.restore.targetTime` to the target time in RFC 3339 UTC, for example `"2026-10-05T14:30:00Z"`. Keep it empty to restore to the last archived WAL.
+4. Set `db.serverName` to a new value, for example `db-2`. The restored cluster writes its new timeline to this folder. The chart fails to render if the two names are equal.
+5. Commit and push. Then delete the cluster:
+   ```bash
+   kubectl --context app -n app delete cluster db
+   ```
+6. Wait. Argo CD creates the `Cluster` again, and CNPG restores it from the object store:
+   ```bash
+   kubectl --context app -n app get cluster db -w
+   ```
+7. When the status is "Cluster in healthy state", restart the app pods. The `db-app` Secret has a new password, and the pods read it only at start:
+   ```bash
+   kubectl --context app -n app delete pod -l 'app.kubernetes.io/name in (backend,worker-default,worker-emails,beat)'
+   ```
+8. Set `db.restore.fromServerName` and `db.restore.targetTime` back to `""`. Keep the new `db.serverName`. Commit and push.
+
+Old folders in the bucket (for example `db/`) stay until you remove them. Keep
+them until the new folder has a base backup.
 
 ## Manual install (no Argo CD)
 

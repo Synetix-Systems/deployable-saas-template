@@ -1,6 +1,5 @@
 # Redis — Celery broker + result backend. Single instance, PVC-backed (RDB
-# snapshots), Recreate strategy. Object storage is EXTERNAL S3 (no in-cluster
-# MinIO) — see walg.* / S3_* values.
+# snapshots), Recreate strategy.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

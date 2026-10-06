@@ -1,0 +1,66 @@
+{{- if .Values.seaweedfs.enabled }}
+# SeaweedFS — in-cluster S3 for app uploads (bucket `env.S3_BUCKET_NAME`) and
+# CNPG backups (bucket from `backup.destinationPath`). One `weed server -s3`
+# pod; the S3 admin identity = the app's S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY
+# from app-dotenv (read via AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY).
+# ponytail: same node + disk as Postgres → covers rollback/PITR, NOT node loss.
+# For disaster recovery point backup.* at an off-site bucket.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: seaweedfs-data
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- if .Values.storage.storageClass }}
+  storageClassName: {{ .Values.storage.storageClass | quote }}
+  {{- end }}
+  resources: { requests: { storage: {{ .Values.storage.seaweedfsSize }} } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: seaweedfs }
+spec:
+  selector: { app.kubernetes.io/name: seaweedfs }
+  ports: [{ name: s3, port: 8333, targetPort: 8333 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: seaweedfs }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app.kubernetes.io/name: seaweedfs } }
+  template:
+    metadata: { labels: { app.kubernetes.io/name: seaweedfs } }
+    spec:
+      containers:
+        - name: seaweedfs
+          image: {{ .Values.seaweedfs.image | quote }}
+          args: ["server", "-s3", "-ip.bind=0.0.0.0"]
+          ports: [{ containerPort: 8333 }]
+          env:
+            - { name: AWS_ACCESS_KEY_ID, valueFrom: { secretKeyRef: { name: app-dotenv, key: S3_ACCESS_KEY_ID } } }
+            - { name: AWS_SECRET_ACCESS_KEY, valueFrom: { secretKeyRef: { name: app-dotenv, key: S3_SECRET_ACCESS_KEY } } }
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - sh
+                  - -c
+                  - |
+                    until wget -q -O /dev/null http://127.0.0.1:8333/healthz; do sleep 1; done
+                    {{- range .Values.seaweedfs.buckets }}
+                    echo "s3.bucket.create -name {{ . }}" | weed shell -master=127.0.0.1:9333 || true
+                    {{- end }}
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8333 }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8333 }
+            initialDelaySeconds: 15
+            periodSeconds: 15
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - { name: data, persistentVolumeClaim: { claimName: seaweedfs-data } }
+{{- end }}

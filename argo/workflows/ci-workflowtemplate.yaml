@@ -1,5 +1,5 @@
 # Argo Workflows CI — BuildKit edition. RUNS ON THE BUILD SERVER's cluster.
-# On a master push it builds backend/frontend/postgres and pushes :latest +
+# On a master push it builds backend/frontend and pushes :latest +
 # :<sha> to Harbor. Argo Image Updater on the app cluster sees the new :latest
 # digest and rolls the Rollouts.
 #
@@ -64,16 +64,6 @@ spec:
                 - { name: tag, value: latest }
                 # SPA calls the API same-origin at /api → empty build arg.
                 - { name: extra, value: "--opt=build-arg:VITE_API_URL=" }
-          - name: build-postgres
-            template: buildctl
-            arguments:
-              parameters:
-                - { name: repo, value: "{{inputs.parameters.repo}}" }
-                - { name: sha, value: "{{inputs.parameters.sha}}" }
-                - { name: dockerfile, value: postgres/Dockerfile }
-                - { name: image, value: your-project/postgres }  # ← CHANGE ME
-                - { name: tag, value: latest }
-                - { name: extra, value: "--progress=plain" }
 
     - name: buildctl
       inputs:

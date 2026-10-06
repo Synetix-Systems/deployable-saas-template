@@ -8,6 +8,7 @@ the full setup; this is the file inventory and apply order.
 | File | Apply to | Purpose |
 |---|---|---|
 | `coredns-custom.yaml` | `kube-system` | forward `*.ts.net` → Tailscale MagicDNS so pods can pull from Harbor. Then `kubectl -n kube-system rollout restart deploy/coredns`. |
+| `cnpg-operator.yaml` | `argocd` | CloudNativePG operator + Barman Cloud plugin (Helm, into `cnpg-system`). Apply before `application.yaml`. Needs cert-manager. |
 | `00-appproject.yaml` | `argocd` | Argo CD AppProject scoping the app. |
 | `application.yaml` | `argocd` | the single Application — tracks `master`, renders `charts/app`, Image Updater annotations. |
 | `image-updater.yaml` | `argocd` | Image Updater CR (v1.x) pointing at the Application. |
@@ -17,7 +18,7 @@ the full setup; this is the file inventory and apply order.
 | File | Apply to | Purpose |
 |---|---|---|
 | `workflows/buildkitd.yaml` | `argo` | rootless BuildKit daemon (host sysctl prereq in the file header). |
-| `workflows/ci-workflowtemplate.yaml` | `argo` | builds backend/frontend/postgres → Harbor `:latest` + `:<sha>`. |
+| `workflows/ci-workflowtemplate.yaml` | `argo` | builds backend/frontend → Harbor `:latest` + `:<sha>`. |
 | `events/eventbus.yaml` | `argo-events` | NATS EventBus. |
 | `events/eventsource-webhook.yaml` | `argo-events` | receives git push webhooks (`:12000/push`). |
 | `events/eventsource-ingress.yaml` | `argo-events` | NodePort `:30120` to expose the webhook (e.g. via `tailscale funnel`). |

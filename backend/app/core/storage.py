@@ -1,9 +1,9 @@
 """S3-compatible object storage helper (boto3).
 
-Works against AWS S3, MinIO, Backblaze B2, or any S3 API. Configure via the
-`S3_*` settings. For real AWS S3 leave `S3_ENDPOINT_URL` empty; for MinIO/other
+Works against AWS S3, SeaweedFS, MinIO, Backblaze B2, or any S3 API. Configure via the
+`S3_*` settings. For real AWS S3 leave `S3_ENDPOINT_URL` empty; for SeaweedFS/other
 set it to the endpoint URL (path-style addressing + SigV4 are forced, which
-MinIO requires).
+self-hosted S3 servers need).
 """
 
 import logging

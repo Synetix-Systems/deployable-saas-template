@@ -30,6 +30,8 @@ spec:
           command: ["celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--concurrency={{ $w.concurrency }}", "-Q", "{{ $name }}"]
           envFrom:
             {{- include "app.envFrom" $ | nindent 12 }}
+          env:
+            {{- include "app.dbEnv" $ | nindent 12 }}
           livenessProbe:
             exec: { command: ["celery", "-A", "app.celery_app", "inspect", "ping", "-t", "5"] }
             initialDelaySeconds: 30
@@ -67,4 +69,6 @@ spec:
           command: ["celery", "-A", "app.celery_app", "beat", "--loglevel=info", "--scheduler", "celery.beat.PersistentScheduler", "--schedule", "/tmp/celerybeat-schedule"]
           envFrom:
             {{- include "app.envFrom" . | nindent 12 }}
+          env:
+            {{- include "app.dbEnv" . | nindent 12 }}
 {{- end }}

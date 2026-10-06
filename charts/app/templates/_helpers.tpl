@@ -10,10 +10,6 @@
 {{- if .Values.image.frontend.image }}{{ .Values.image.frontend.image }}{{- else }}{{ .Values.image.registry }}/{{ .Values.image.frontend.repo }}:{{ .Values.image.frontend.tag }}{{- end }}
 {{- end -}}
 
-{{- define "app.image.postgres" -}}
-{{ .Values.image.registry }}/{{ .Values.image.postgres.repo }}:{{ .Values.image.postgres.tag }}
-{{- end -}}
-
 {{/* Common labels */}}
 {{- define "app.labels" -}}
 app.kubernetes.io/part-of: app
@@ -29,6 +25,13 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
     name: app-env
 {{- end -}}
 
+{{/* DB credentials from the CNPG-generated Secret db-app. `env` beats
+     envFrom, so these win over anything in app-dotenv. */}}
+{{- define "app.dbEnv" -}}
+- { name: POSTGRES_USER, valueFrom: { secretKeyRef: { name: db-app, key: username } } }
+- { name: POSTGRES_PASSWORD, valueFrom: { secretKeyRef: { name: db-app, key: password } } }
+{{- end -}}
+
 {{/* optional imagePullSecrets */}}
 {{- define "app.pullSecrets" -}}
 {{- if .Values.image.pullSecret }}
@@ -41,5 +44,5 @@ imagePullSecrets:
 {{- define "app.waitForInfra" -}}
 - name: wait-for-infra
   image: busybox:1.36
-  command: ["sh", "-c", "until nc -z pgbouncer 6432; do sleep 2; done; until nc -z redis 6379; do sleep 2; done"]
+  command: ["sh", "-c", "until nc -z pgbouncer 5432; do sleep 2; done; until nc -z redis 6379; do sleep 2; done"]
 {{- end -}}

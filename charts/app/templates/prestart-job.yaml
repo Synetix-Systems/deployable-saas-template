@@ -1,5 +1,5 @@
 # Migrations + seed. As an Argo CD Sync hook in sync-wave 1 it runs AFTER infra
-# (wave 0: db/redis/pgbouncer) and BEFORE the app Rollouts (wave 2), recreated
+# (wave 0: CNPG db/pooler, redis, seaweedfs) and BEFORE the app Rollouts (wave 2), recreated
 # on every sync. (A plain `helm install` runs it as an ordinary Job.)
 # Connects DIRECTLY to Postgres (not via pgbouncer) so DDL/migrations aren't
 # affected by transaction pooling.
@@ -26,7 +26,7 @@ spec:
             - sh
             - -c
             - |
-              until nc -z db 5432; do sleep 2; done
+              until nc -z db-rw 5432; do sleep 2; done
               until nc -z redis 6379; do sleep 2; done
       containers:
         - name: prestart
@@ -36,6 +36,7 @@ spec:
           envFrom:
             {{- include "app.envFrom" . | nindent 12 }}
           env:
+            {{- include "app.dbEnv" . | nindent 12 }}
             # migrations bypass pgbouncer (direct to Postgres)
-            - { name: POSTGRES_SERVER, value: db }
+            - { name: POSTGRES_SERVER, value: db-rw }
             - { name: POSTGRES_PORT, value: "5432" }
