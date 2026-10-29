@@ -11,8 +11,22 @@ import {
 import { handleError } from "@/utils"
 import useCustomToast from "./useCustomToast"
 
+// ponytail: client-side expiry check for instant redirect; backend still validates every request
 const isLoggedIn = () => {
-  return localStorage.getItem("access_token") !== null
+  const token = localStorage.getItem("access_token")
+  if (!token) return false
+  try {
+    const payload = JSON.parse(atob(token.split(".")[1]))
+    if (typeof payload.exp === "number" && payload.exp * 1000 <= Date.now()) {
+      localStorage.removeItem("access_token")
+      return false
+    }
+  } catch {
+    // malformed token — treat as logged out
+    localStorage.removeItem("access_token")
+    return false
+  }
+  return true
 }
 
 const useAuth = () => {
