@@ -1,0 +1,91 @@
+name: CI
+
+# Pull requests and main only. Do NOT add `push: milestone/**`: the pull
+# request already runs on every milestone push, so a push trigger runs it twice.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Milestone scope. A GSD milestone pushes one commit per step (plan, execute,
+  # audit, ...). Overlord reads CI on a milestone branch only at the sync head
+  # (`gsd(sync_main)`), so the full suite on every step commit is wasted runner
+  # time (58% of all CI minutes on project-overlord, 2026-11-05).
+  # full=false only when ALL are true:
+  #   - the event is a pull request from a `milestone/*` branch
+  #   - the head commit is by an automation identity (Perpetuity or the Overlord bot)
+  #   - the head commit subject does not start with `gsd(sync_main)`
+  #   - the change does not edit `.github/`
+  # A commit a person pushes by hand always gets the full suite.
+  scope:
+    runs-on: NAME-runners
+    outputs:
+      full: ${{ steps.s.outputs.full }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: s
+        env:
+          EVENT: ${{ github.event_name }}
+          BRANCH: ${{ github.head_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          full=true
+          if [ "$EVENT" = pull_request ] && [[ "$BRANCH" == milestone/* ]]; then
+            author=$(git log -1 --format=%ae "$HEAD_SHA")
+            subject=$(git log -1 --format=%s "$HEAD_SHA")
+            case "$author" in
+              perpetuity@example.com|*project-overlord-connector*)
+                if [[ "$subject" != "gsd(sync_main)"* ]] \
+                  && ! git diff --name-only "$BASE_SHA...$HEAD_SHA" | grep -q '^\.github/'; then
+                  full=false
+                fi ;;
+            esac
+            echo "milestone head by $author: $subject"
+          fi
+          echo "full=$full" | tee -a "$GITHUB_OUTPUT"
+
+  # Every heavy job: `needs: scope` and `if: needs.scope.outputs.full == 'true'`.
+  # A skipped job counts as passing a required check. That is safe here, because
+  # a milestone PR is a draft until Overlord marks it ready, and it marks it
+  # ready only after green CI on the sync head, which always runs in full.
+  backend:
+    needs: scope
+    if: needs.scope.outputs.full == 'true'
+    runs-on: NAME-runners
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+      - run: uv sync --frozen
+      - run: uv run bash scripts/lint.sh
+      # Add the test step here when the first tests exist. tests/ needs Postgres.
+
+  frontend:
+    needs: scope
+    if: needs.scope.outputs.full == 'true'
+    runs-on: NAME-runners
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile  # workspace root holds bun.lock
+        working-directory: .
+      - run: bun run biome check --no-errors-on-unmatched --files-ignore-unknown=true ./
+      - run: bun run build
