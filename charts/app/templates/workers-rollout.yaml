@@ -33,10 +33,12 @@ spec:
           env:
             {{- include "app.dbEnv" $ | nindent 12 }}
           livenessProbe:
-            exec: { command: ["celery", "-A", "app.celery_app", "inspect", "ping", "-t", "5"] }
+            # Ping only this worker. A broadcast ping waits the full -t for
+            # replies, and with CLI start-up it ran past timeoutSeconds.
+            exec: { command: ["sh", "-c", "celery -A app.celery_app inspect ping -d celery@$HOSTNAME -t 5"] }
             initialDelaySeconds: 30
             periodSeconds: 30
-            timeoutSeconds: 10
+            timeoutSeconds: 20
             failureThreshold: 3
 ---
 {{- end }}
